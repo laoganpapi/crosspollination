@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "crosspollination": {
+      "command": "node",
+      "args": ["dist/index.js"],
+      "cwd": "/path/to/crosspollination",
+      "env": {
+        "GOOGLE_CLIENT_ID": "your-client-id.apps.googleusercontent.com",
+        "GOOGLE_CLIENT_SECRET": "your-client-secret",
+        "ENCRYPTION_KEY": "your-64-char-hex-key"
+      }
+    }
+  }
+}
