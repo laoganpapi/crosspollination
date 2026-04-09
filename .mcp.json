@@ -1,0 +1,7 @@
+{
+  "mcpServers": {
+    "crosspollination": {
+      "command": "/home/user/crosspollination/start.sh"
+    }
+  }
+}
