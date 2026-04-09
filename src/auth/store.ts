@@ -1,26 +1,38 @@
 import { createCipheriv, createDecipheriv, randomBytes } from "node:crypto";
-import { readFile, writeFile, mkdir } from "node:fs/promises";
-import { existsSync } from "node:fs";
+import { readFile, writeFile, mkdir, rename, unlink } from "node:fs/promises";
+import { homedir } from "node:os";
 import { join } from "node:path";
 import type { AccountInfo, AccountStore, EncryptedPayload } from "../types.js";
 
 const ALGORITHM = "aes-256-gcm";
 const STORE_DIR = join(
-  process.env.CROSSPOLLINATION_DATA_DIR ||
-    join(process.env.HOME || "~", ".crosspollination"),
+  process.env.CROSSPOLLINATION_DATA_DIR || join(homedir(), ".crosspollination"),
 );
 const STORE_FILE = join(STORE_DIR, "accounts.enc.json");
 
+// ─── Encryption key management ──────────────────────────────────────────────
+
+let cachedKey: Buffer | null = null;
+
 function getEncryptionKey(): Buffer {
+  if (cachedKey) return cachedKey;
   const key = process.env.ENCRYPTION_KEY;
-  if (!key || key.length !== 64) {
+  if (!key || key.length !== 64 || !/^[0-9a-fA-F]{64}$/.test(key)) {
     throw new Error(
       "ENCRYPTION_KEY must be a 64-character hex string (32 bytes). " +
         'Generate one with: node -e "console.log(require(\'crypto\').randomBytes(32).toString(\'hex\'))"',
     );
   }
-  return Buffer.from(key, "hex");
+  cachedKey = Buffer.from(key, "hex");
+  return cachedKey;
 }
+
+/** Call at startup to fail fast if the key is missing or malformed. */
+export function validateEncryptionKey(): void {
+  getEncryptionKey();
+}
+
+// ─── Crypto primitives ─────────────────────────────────────────────────────
 
 function encrypt(data: string): EncryptedPayload {
   const key = getEncryptionKey();
@@ -50,28 +62,61 @@ function decrypt(payload: EncryptedPayload): string {
   return decrypted;
 }
 
+// ─── File I/O with atomic writes ────────────────────────────────────────────
+
+// Serialize all store writes through a single promise chain to prevent
+// concurrent read-modify-write races.
+let writeQueue: Promise<void> = Promise.resolve();
+
 async function loadStore(): Promise<AccountStore> {
-  if (!existsSync(STORE_FILE)) {
-    return { version: 1, accounts: {} };
+  try {
+    const raw = await readFile(STORE_FILE, "utf8");
+    return JSON.parse(raw) as AccountStore;
+  } catch (err: unknown) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") {
+      return { version: 1, accounts: {} };
+    }
+    throw err;
   }
-  const raw = await readFile(STORE_FILE, "utf8");
-  return JSON.parse(raw) as AccountStore;
 }
 
-async function saveStore(store: AccountStore): Promise<void> {
-  if (!existsSync(STORE_DIR)) {
-    await mkdir(STORE_DIR, { recursive: true, mode: 0o700 });
+async function saveStoreAtomic(store: AccountStore): Promise<void> {
+  await mkdir(STORE_DIR, { recursive: true, mode: 0o700 });
+  // Write to a temp file then atomically rename — prevents corruption if
+  // the process is killed mid-write.
+  const tmpFile = `${STORE_FILE}.${randomBytes(4).toString("hex")}.tmp`;
+  await writeFile(tmpFile, JSON.stringify(store, null, 2), { mode: 0o600 });
+  try {
+    await rename(tmpFile, STORE_FILE);
+  } catch (err) {
+    // Clean up the temp file if rename fails
+    await unlink(tmpFile).catch(() => {});
+    throw err;
   }
-  await writeFile(STORE_FILE, JSON.stringify(store, null, 2), {
-    mode: 0o600,
-  });
 }
+
+/** Run a read-modify-write cycle under a serialized queue. */
+async function withStore(
+  fn: (store: AccountStore) => AccountStore | Promise<AccountStore>,
+): Promise<AccountStore> {
+  let result!: AccountStore;
+  writeQueue = writeQueue.then(async () => {
+    const store = await loadStore();
+    result = await fn(store);
+    await saveStoreAtomic(result);
+  });
+  await writeQueue;
+  return result;
+}
+
+// ─── Public API ─────────────────────────────────────────────────────────────
 
 export async function saveAccount(account: AccountInfo): Promise<void> {
-  const store = await loadStore();
   const serialized = JSON.stringify(account);
-  store.accounts[account.id] = encrypt(serialized);
-  await saveStore(store);
+  await withStore((store) => {
+    store.accounts[account.id] = encrypt(serialized);
+    return store;
+  });
 }
 
 export async function getAccount(
@@ -95,11 +140,15 @@ export async function getAllAccounts(): Promise<AccountInfo[]> {
 }
 
 export async function removeAccount(accountId: string): Promise<boolean> {
-  const store = await loadStore();
-  if (!store.accounts[accountId]) return false;
-  delete store.accounts[accountId];
-  await saveStore(store);
-  return true;
+  let existed = false;
+  await withStore((store) => {
+    existed = accountId in store.accounts;
+    if (existed) {
+      delete store.accounts[accountId];
+    }
+    return store;
+  });
+  return existed;
 }
 
 export async function findAccountByEmail(

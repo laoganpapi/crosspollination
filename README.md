@@ -70,8 +70,7 @@ Once configured, Claude has access to these tools:
 
 | Tool | Description |
 |------|-------------|
-| `search_drive` | Search files in specific or all accounts |
-| `cross_account_search` | Unified search across every connected account |
+| `search_drive` | Search files across all accounts (or specific ones) |
 | `list_drive_files` | Browse files/folders in an account |
 | `read_drive_file` | Read file contents (Docs, Sheets, text files) |
 | `get_file_info` | Get file metadata (size, type, link) |
@@ -92,9 +91,19 @@ Once configured, Claude has access to these tools:
 
 - OAuth tokens are encrypted with AES-256-GCM before being written to disk
 - The credential store (`~/.crosspollination/accounts.enc.json`) is created with `600` permissions (owner-only read/write)
+- Store writes are atomic (write to temp file + rename) to prevent corruption
 - The encryption key never touches disk — it's passed via environment variable
-- OAuth flow uses CSRF protection via state parameter
+- OAuth callback server binds to `127.0.0.1` only — never exposed to the network
+- OAuth flow uses CSRF protection via state parameter and a 5-minute timeout
+- All error messages are sanitized to prevent token/credential leakage
+- Input labels are validated (alphanumeric, max 64 chars) to prevent injection
+- Google Drive query values are escaped to prevent query injection
+- File IDs are validated against an allowlist pattern before use
+- Google Workspace exports are capped at 5 MB to prevent token budget exhaustion
+- Per-account rate limiting (30 requests/minute) prevents API quota blowout
+- Token revocation on account removal — tokens are revoked with Google, not just deleted locally
 - Drive access is **read-only** — this server cannot modify or delete your files
+- All environment variables are validated at startup (fail fast, not at first use)
 
 ## Environment Variables
 

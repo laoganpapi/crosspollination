@@ -2,5 +2,6 @@ node_modules/
 dist/
 .env
 *.credentials.json
+*.tmp
 accounts/
 .crosspollination/
