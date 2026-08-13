@@ -3,11 +3,13 @@ name: prd
 description: Write or review a product requirements document. Load when asked for a PRD, a product or feature proposal, a requirements doc, or product user stories. Covers structure, section-by-section guidance, requirement style, prioritization, and pitfalls.
 ---
 
+<!-- predelivery-allow: journey, journeys -->
+
 # PRD authoring
 
-Sources: Atlassian's agile requirements guide; Carlin Yuen's "Writing PRDs and product requirements." A PRD is a decision document — master §11 applies on top of everything below (rationale per decision, labeled decided-vs-open, observable outcomes). The writing-standards skill applies too; load both.
+Sources: Atlassian's agile requirements guide; Carlin Yuen's "Writing PRDs and product requirements." A PRD is a decision document, so §11 applies on top of everything below: rationale per decision, decided-versus-open labelled, observable outcomes. Load the writing-standards skill, which carries §11 in full — it ships in every repo, and the master does not.
 
-## What a PRD is, and is not
+## Definition and limits
 
 - A vehicle for alignment: it defines the product's purpose, features, and behavior so the team shares one understanding of what to build and why. Success test: a reader understands the priorities, the features, and the work without needing more detail.
 - Built on shared understanding of the customer, not exhaustive specification. Spec'ing every detail and hoping you spec'd the right things is the failure mode agile requirements exist to avoid. State higher-level requirements; leave implementation to the people building, who can fill it in because they share the customer understanding.
@@ -22,12 +24,12 @@ Header table first: owner and participants, status, target release.
 2. **Objectives and measurable outcomes.** 2–3 bullets defining success, tied to background and strategic fit — why this, why now, how it serves the larger goal.
 3. **Target users and use cases.** Specific users. Alignment here keeps development matched to positioning.
 4. **Assumptions.** What is being taken as true — technical, business, and user assumptions the plan rests on.
-5. **Current journeys / landscape** (optional). How users cope today, existing solutions. Link out to detail; do not embed it.
+5. **Current workarounds** (optional). How users cope today, existing solutions. Link out to detail; do not embed it.
 6. **Proposed solution / elevator pitch.** 2–3 lines in plain language. For a product: the top 3 MVP value propositions and a conceptual model diagram.
 7. **Requirements / user stories.** The core — see requirement style below.
 8. **User interaction and design.** Links to design explorations and wireframes per story, added as the solution firms up.
 9. **Questions.** A live table of things still to decide or research — this is the §11 Open list; readers ask here instead of inventing.
-10. **What we're not doing.** Explicit out-of-scope items, including deferred-not-rejected ones, so focus holds.
+10. **Out of scope.** Explicit out-of-scope items, including deferred-not-rejected ones, so focus holds.
 11. **Appendix.** Links only: UX detail, design decisions, go-to-market, competitive analysis.
 
 ## Requirement style
@@ -48,6 +50,6 @@ Don't:
 
 ## Pitfalls
 
-- Churn: rewriting the PRD every time design or engineering makes a call. Written right, the stable sections — problem, users, landscape, goals, functional requirements — don't change on a whim; only priorities and the appendix should move.
+- Churn: rewriting the PRD every time design or engineering makes a call. Written right, the stable sections — problem, users, workarounds, goals, functional requirements — don't change on a whim; only priorities and the appendix should move.
 - Comment threads litigating implementation detail inside the PRD. Move those to the owning team's space; the PRD records the decision and the why (§11.1).
 - Length nobody reads. Cut before adding; a longer document in the same style fixes nothing (§11).

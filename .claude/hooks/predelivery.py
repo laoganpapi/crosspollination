@@ -1,0 +1,918 @@
+#!/usr/bin/env python3
+"""Pre-delivery check for prose deliverables.
+
+Enforces the mechanically checkable part of the master's rules at write time,
+so a violation is stopped before it ships instead of being caught in review.
+The banned words and phrases are read from the deployed writing-standards
+skill rather than copied here, so there is one source of truth (master §5.4).
+
+Two ways to run:
+
+    predelivery.py FILE [FILE ...]    check files already on disk
+    predelivery.py --hook             PreToolUse hook, reads JSON on stdin
+
+Standalone exit codes: 0 = clean or warnings only, 1 = blocking findings.
+As a hook it always exits 0 and speaks through the JSON it prints, and it
+fails open — any internal error lets the write through rather than wedging
+the session.
+"""
+
+from __future__ import annotations
+
+import json
+import re
+import sys
+from pathlib import Path
+
+BLOCK = "block"
+WARN = "warn"
+
+# .docx is absent on purpose: those are written through code, never through
+# Write, so listing it would imply coverage that does not exist.
+PROSE_SUFFIXES = {".md", ".markdown", ".mdx", ".txt", ".rst", ".adoc"}
+
+# Files that enumerate the banned vocabulary. Scanning them would flag every
+# rule for containing the word it bans.
+RULE_FILES = {
+    ".claude/universal.md",
+    ".claude/skills/writing-standards/SKILL.md",
+}
+# "scratchpad" is deliberately absent: a draft written there and moved with a
+# shell command is an ordinary working pattern, and exempting it produces an
+# unchecked deliverable.
+RULE_DIRS = {".git", "node_modules", ".venv"}
+# These hold the rule text, but only in the home repo. Anywhere else they are
+# ordinary directory names and must not exempt a whole tree from every check.
+HOME_ONLY_DIRS = {"master", "install"}
+
+# Never date-prefixed (master §7.4).
+INFRA_NAMES = {
+    "CLAUDE.md",
+    "CLAUDE.local.md",
+    "README.md",
+    "index.md",
+    "ledger.md",
+    "SKILL.md",
+    "universal.md",
+    "AGENTS.md",
+    "CONTRIBUTING.md",
+    "CHANGELOG.md",
+    "LICENSE.md",
+}
+
+# Acronyms common enough that spelling them out would read as padding.
+# Anything outside this list needs a gloss on first use (master §1.6).
+ACRONYM_OK = {
+    "AI", "API", "ARR", "CEO", "CFO", "COO", "CTO", "CI", "CD", "CLI", "CSS",
+    "CSV", "DNS", "EU", "FAQ", "GB", "GDP", "GPU", "HTML", "HTTP", "HTTPS",
+    "ID", "IP", "IT", "JSON", "KB", "MB", "MCP", "OK", "OS", "PDF", "PR",
+    "RAM", "REST", "SDK", "SQL", "SSH", "TB", "TV", "UI", "UK", "URL", "US",
+    "USA", "USD", "UTC", "UX", "VC", "XML", "YAML", "PM", "AM", "Q1", "Q2",
+    "Q3", "Q4", "FY", "TODO", "NDA", "IPO", "CEO", "LLC", "VAT", "KPI",
+}
+
+# What "the rules loaded" means, in one place: the selftest and the per-write
+# guard must not be able to disagree.
+VOCAB_FLOOR = {"outright": 20, "replace": 8, "sense": 25, "openers": 3, "phrases": 40}
+
+_ABBREV = (
+    r"(?<!\bMr)(?<!\bMrs)(?<!\bMs)(?<!\bDr)(?<!\bSt)(?<!\bJr)(?<!\bSr)"
+    r"(?<!\bvs)(?<!\betc)(?<!\bNo)(?<!\bapprox)(?<!\bFig)(?<!\bal)"
+    r"(?<!\be\.g)(?<!\bi\.e)(?<!\bU\.S)(?<!\bInc)(?<!\bLtd)(?<!\bCo)"
+)
+SENTENCE_END = re.compile(_ABBREV + r"[.!?]+[\"')\]]*(?:\s+|$)(?=[A-Z\"'(\[]|$)")
+
+DATE_PREFIX = re.compile(r"^(?:[1-9]|1[0-2]) (?:[1-9]|[12]\d|3[01]) \d{2} \S")
+BAD_DATE_PREFIX = re.compile(r"^(\d{1,2})[_\-.](\d{1,2})[_\-.](\d{2,4})[_\-.]")
+
+FIGURE = re.compile(
+    r"\$\s?\d[\d,]*(?:\.\d+)?\s*(?:bn?|m|k|billion|million|thousand|trillion)?\b"
+    r"|\b\d+(?:\.\d+)?\s?%"
+    r"|\b\d+(?:\.\d+)?x\b",
+    re.IGNORECASE,
+)
+LEDGER_ENTRY = re.compile(r"^\s*[-*]\s*\[\d{4}-\d{2}-\d{2}\]", re.MULTILINE)
+
+LITOTES = re.compile(
+    r"\bnot\s+(?:bad|uncommon|unlike|unusual|without\s+merit|insignificant|"
+    r"unimportant|impossible|unheard\s+of|unhelpful|unreasonable|unclear|"
+    r"unlikely|untrue|unknown|dissimilar)\b|\bno\s+small\s+(?:feat|matter|thing)\b",
+    re.IGNORECASE,
+)
+CLOSER_OPENERS = re.compile(
+    r"^\s*(?:in conclusion|in summary|to sum up|to summarise|to summarize|"
+    r"overall|ultimately)\b[,:]?",
+    re.IGNORECASE,
+)
+SIGN_OFF = re.compile(
+    r"i hope this helps|hope that helps|let me know if|feel free to (?:ask|reach)|"
+    r"happy to help|don't hesitate to",
+    re.IGNORECASE,
+)
+QUESTION_HEAD = re.compile(r"^(?:how|why|what|when|where|who|which|should|can|do|does|is|are)\b", re.I)
+# "Seven avenues, ranked" — a verdict with the judge and the basis deleted.
+VERDICT_HEAD = re.compile(r",\s+\w+(?:ed|en)\b\s*$", re.I)
+# A bold-only line sitting directly above a heading is a kicker.
+BOLD_ONLY = re.compile(r"^\s*\*\*[^*]{2,80}\*\*\s*$")
+SENTENCE_HEAD = re.compile(r"\s(?:is|are|was|were|will|should|can|could|must|does|do)\s", re.I)
+# "The thing to lead with tomorrow" carries a verb; "Research to decision" is
+# a noun phrase, so match a verb after "to" rather than any word.
+INFINITIVE_HEAD = re.compile(
+    r"\bto (?:lead|do|use|make|build|set|run|get|know|watch|ask|say|avoid|fix|"
+    r"start|ship|pick|choose|decide|read|write|send|take|keep|check|handle)\b",
+    re.I,
+)
+
+
+class Finding:
+    __slots__ = ("severity", "rule", "line", "message")
+
+    def __init__(self, severity: str, rule: str, line: int, message: str) -> None:
+        self.severity = severity
+        self.rule = rule
+        self.line = line
+        self.message = message
+
+    def render(self, path: str) -> str:
+        where = f"{path}:{self.line}" if self.line else path
+        return f"  [{self.rule}] {where} — {self.message}"
+
+
+# --------------------------------------------------------------------------
+# Reading the rules out of the deployed skill
+# --------------------------------------------------------------------------
+
+def find_repo_root(start: Path) -> Path | None:
+    for candidate in [start, *start.parents]:
+        if (candidate / ".git").exists() or (candidate / ".claude").is_dir():
+            return candidate
+    return None
+
+
+def read_text(path: Path) -> str | None:
+    """Read a file for checking.
+
+    Undecodable bytes become U+FFFD rather than raising. UnicodeDecodeError is
+    a ValueError, so it escapes every OSError handler and lands in the mute
+    top-level catch: one latin-1 byte in someone else's file would switch the
+    checker off for every write, invisibly and until the file is re-encoded.
+    """
+    try:
+        return path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+
+
+def load_vocabulary(root: Path | None) -> dict:
+    """Pull the banned lists out of the writing-standards skill.
+
+    Returns empty lists when the skill is missing, so a repo without the
+    bundle still gets the structural checks.
+    """
+    empty = {"outright": [], "replace": {}, "sense": {}, "openers": [], "phrases": []}
+    # Prefer the skill shipped beside this hook. find_repo_root can bind to a
+    # nested .git (a submodule, a vendored dependency) or to nothing at all for
+    # a file outside any repo, and then every vocabulary check would pass on
+    # everything without a word about it.
+    skill = Path(__file__).resolve().parents[1] / "skills" / "writing-standards" / "SKILL.md"
+    if not skill.is_file() and root is not None:
+        skill = root / ".claude" / "skills" / "writing-standards" / "SKILL.md"
+    if not skill.is_file():
+        return empty
+    text = read_text(skill)
+    if text is None:
+        return empty
+
+    sections: dict[str, str] = {}
+    current = None
+    buf: list[str] = []
+    for line in text.splitlines():
+        if line.startswith("### "):
+            if current:
+                sections[current] = "\n".join(buf)
+            current = line[4:].strip().lower()
+            buf = []
+        elif line.startswith("## ") and current:
+            sections[current] = "\n".join(buf)
+            current = None
+            buf = []
+        elif current:
+            buf.append(line)
+    if current:
+        sections[current] = "\n".join(buf)
+
+    def find_section(*needles: str) -> str:
+        for name, body in sections.items():
+            if all(n in name for n in needles):
+                return body
+        return ""
+
+    def comma_words(body: str) -> list[str]:
+        for line in body.splitlines():
+            line = line.strip()
+            if not line or line.startswith(("-", "*", "#")):
+                continue
+            head = line.split(" — ")[0]
+            return [w.strip().lower() for w in head.split(",") if w.strip()]
+        return []
+
+    def bullet_terms(body: str) -> dict[str, str]:
+        out: dict[str, str] = {}
+        for line in body.splitlines():
+            line = line.strip()
+            if not line.startswith("- "):
+                continue
+            body_text = line[2:]
+            head, _, note = body_text.partition(" — ")
+            if not note:
+                continue
+            for term in head.split(","):
+                term = term.strip().lower()
+                if term and " " not in term.strip("-"):
+                    out[term] = note.strip()
+                elif term:
+                    out[term] = note.strip()
+        return out
+
+    outright = comma_words(find_section("banned outright"))
+    replace = bullet_terms(find_section("replacement"))
+    sense = bullet_terms(find_section("tell sense"))
+    openers = comma_words(find_section("sentence-opening"))
+
+    phrases: list[tuple[str, str]] = []
+    for line in find_section("phrases and constructions").splitlines():
+        line = line.strip()
+        if not line.startswith("- "):
+            continue
+        body_text = line[2:]
+        # Guidance follows the first em-dash that sits outside a quote. Text
+        # after it holds replacements ("Say the thing: 'good', 'useful'"),
+        # which must not be read back as banned phrases.
+        quoted_blanked = re.sub(r'"[^"]*"', lambda m: " " * len(m.group(0)), body_text)
+        split_at = quoted_blanked.find(" — ")
+        head = body_text[:split_at] if split_at != -1 else body_text
+        for quoted in re.findall(r'"([^"]{6,})"', head):
+            phrases.append((quoted, body_text))
+
+    return {
+        "outright": outright,
+        "replace": replace,
+        "sense": sense,
+        "openers": openers,
+        "phrases": phrases,
+    }
+
+
+# --------------------------------------------------------------------------
+# Masking: blank out regions where the rules do not apply, keeping offsets
+# --------------------------------------------------------------------------
+
+def mask(text: str) -> str:
+    """Replace code, links and comments with spaces of equal length.
+
+    Offsets and line numbers stay valid, so findings still point at the
+    right line.
+    """
+    out = list(text)
+
+    def blank(start: int, end: int) -> None:
+        for i in range(start, min(end, len(out))):
+            if out[i] != "\n":
+                out[i] = " "
+
+    # Front matter, anchored to the very top. Unanchored, this reads any pair
+    # of `---` section rules as front matter and blanks everything between
+    # them, which switches every check off for that stretch without saying so.
+    front = re.match(r"\A---\n.*?\n---\n", text, re.DOTALL)
+    if front:
+        blank(front.start(), front.end())
+
+    # Spans that legitimately cross lines. DOTALL belongs to these only.
+    for pattern in (
+        r"```.*?```",           # fenced code
+        r"~~~.*?~~~",
+        r"<!--.*?-->",          # html comments
+    ):
+        for m in re.finditer(pattern, text, re.DOTALL):
+            blank(m.start(), m.end())
+
+    # Line-bound spans. DOTALL must never reach these: it lets `.` match a
+    # newline, so a greedy `.*$` runs from the first match to the end of the
+    # file and one blockquote blanks every rule out of everything after it,
+    # without a word. Measured before this split: one blockquote line blanked
+    # 99.5% of a 98,000-character file and the checker reported it clean.
+    #
+    # Carried text, exempt under §2 because Claude did not choose it: §4.1
+    # requires source terms verbatim, so the ban must not reach inside a
+    # blockquote or a ledger entry.
+    for pattern in (
+        r"`[^`\n]+`",           # inline code
+        r"\]\([^)\n]*\)",       # link targets
+        r"https?://\S+",
+        r"^[ \t]*>.*$",                                # blockquoted source
+        r"^[ \t]*[-*][ \t]*\[\d{4}-\d{2}-\d{2}\].*$",  # ledger entries (§3.4)
+    ):
+        for m in re.finditer(pattern, text, re.MULTILINE):
+            blank(m.start(), m.end())
+
+    # Quoted spans, paired in document order. A regex cannot do this: with a
+    # minimum span length a short quoted term ("MVP") fails to pair, and the
+    # scanner then joins its closing quote to the next term's opening quote,
+    # blanking every rule out of the prose between them. Pairing in order
+    # cannot skip a quote. A blank line inside means the quote never closed.
+    # Scanned against what is left after the blanking above, never the original.
+    # A stray double quote inside a code fence is already gone by here; counting
+    # it anyway shifted the pairing by one, so a real opening quote paired with a
+    # code-fence quote and every rule stopped applying to the prose between them.
+    so_far = "".join(out)
+    straight = [m.start() for m in re.finditer(r"\"", so_far)]
+    for start, end in zip(straight[0::2], straight[1::2]):
+        if "\n\n" not in text[start:end]:
+            blank(start, end + 1)
+    open_at = None
+    for m in re.finditer(r"[“”]", so_far):
+        if m.group(0) == "“" and open_at is None:
+            open_at = m.start()
+        elif m.group(0) == "”" and open_at is not None:
+            if "\n\n" not in text[open_at:m.end()]:
+                blank(open_at, m.end())
+            open_at = None
+    return "".join(out)
+
+
+def line_of(text: str, index: int) -> int:
+    return text.count("\n", 0, index) + 1
+
+
+LIST_MARKER = re.compile(r"^([-*+]|\d+[.)])\s+")
+
+
+def prose_blocks(masked: str) -> list[tuple[int, str, bool]]:
+    """Blocks of running prose, as (line, text, is_list_item).
+
+    A list item is its own block: a seven-sentence run behind one bullet is
+    the same paragraph, and without this the sentence cap is cleared by adding
+    a dash — which is what the cap's own message tells the writer to do.
+    """
+    blocks: list[tuple[int, str, bool]] = []
+    current: list[str] = []
+    start_line = 0
+
+    def flush() -> None:
+        nonlocal current
+        if current:
+            blocks.append((start_line, " ".join(current), False))
+            current = []
+
+    for number, raw in enumerate(masked.splitlines(), start=1):
+        stripped = raw.strip()
+        if LIST_MARKER.match(stripped):
+            flush()
+            blocks.append((number, LIST_MARKER.sub("", stripped), True))
+        elif not stripped or stripped.startswith(("#", "|", ">")):
+            flush()
+        else:
+            if not current:
+                start_line = number
+            current.append(stripped)
+    flush()
+    return blocks
+
+
+def count_sentences(paragraph: str) -> int:
+    text = paragraph.strip()
+    if not text:
+        return 0
+    return max(1, len(SENTENCE_END.findall(text)))
+
+
+# --------------------------------------------------------------------------
+# Checks
+# --------------------------------------------------------------------------
+
+def check_filename(path: Path, root: Path | None) -> list[Finding]:
+    if path.suffix.lower() not in PROSE_SUFFIXES:
+        return []
+    if path.name in INFRA_NAMES:
+        return []
+    rel = relative(path, root)
+    if any(part in RULE_DIRS for part in Path(rel).parts):
+        return []
+    # Memory-graph nodes are infrastructure, not deliverables: their filename is
+    # the node id (master §6.4), so a date prefix would break the id/file match.
+    if Path(rel).parts and Path(rel).parts[0] in {".claude", "skills-library", ".github", "docs", "memory"}:
+        return []
+    stem = path.name
+    if DATE_PREFIX.match(stem):
+        return []
+    bad = BAD_DATE_PREFIX.match(stem)
+    if bad:
+        month, day, year = bad.group(1), bad.group(2), bad.group(3)[-2:]
+        rest = stem[bad.end():].replace("_", " ").replace("-", " ")
+        suggestion = f"{int(month)} {int(day)} {year} {rest}"
+        return [Finding(BLOCK, "filename", 0,
+                        f"master §7.4 wants spaces and no leading zeros in the date prefix. "
+                        f"Rename to: {suggestion!r}")]
+    # §7.4 opens "a name Alex states wins verbatim" and applies the date form
+    # only when naming is left to Claude. The hook cannot see the ask, so which
+    # clause governs is a judgement — warn, never block (master §9.5).
+    return [Finding(WARN, "filename", 0,
+                    "master §7.4: when naming is left to Claude, deliverable filenames start "
+                    "with a date in 'M D YY' form, no leading zeros, e.g. '8 11 26 review.md'. "
+                    "A name Alex stated wins verbatim — ignore this if he named the file.")]
+
+
+def allowed_terms(text: str) -> set[str]:
+    """Terms the file declares as carried, not chosen (master §2 exemption).
+
+    A file quoting a proper name or an established term of art marks it with
+    `<!-- predelivery-allow: hidden gem, moat -->` and the ban steps aside.
+    """
+    out: set[str] = set()
+    for m in re.finditer(r"<!--\s*predelivery-allow:\s*([^>]+?)\s*-->", text, re.I):
+        out.update(t.strip().lower() for t in m.group(1).split(",") if t.strip())
+    return out
+
+
+def check_vocabulary(text: str, masked: str, vocab: dict) -> list[Finding]:
+    found: list[Finding] = []
+    lowered = masked.lower()
+    exempt = allowed_terms(text)
+    if exempt:
+        # The pardon is read out of the file being written, so the same write
+        # can carry its own. Recording it keeps that visible rather than silent.
+        found.append(Finding(WARN, "exemption", 0,
+                             f"§2 exemption claimed for: {', '.join(sorted(exempt))}. Valid only "
+                             f"for a term carried from a source, never for a word Claude chose."))
+
+    for word in vocab["outright"]:
+        if word in exempt:
+            continue
+        for m in re.finditer(rf"\b{re.escape(word)}\w*\b", lowered):
+            found.append(Finding(BLOCK, "banned-word", line_of(masked, m.start()),
+                                 f"master §2 bans {word!r} outright."))
+            break
+
+    for word, note in vocab["replace"].items():
+        if word in exempt:
+            continue
+        for m in re.finditer(rf"\b{re.escape(word)}\w*\b", lowered):
+            found.append(Finding(BLOCK, "banned-word", line_of(masked, m.start()),
+                                 f"master §2: {word!r} — {note}"))
+            break
+
+    for word, note in vocab["sense"].items():
+        if word in exempt:
+            continue
+        for m in re.finditer(rf"\b{re.escape(word)}\w*\b", lowered):
+            found.append(Finding(WARN, "banned-sense", line_of(masked, m.start()),
+                                 f"master §2: {word!r} — {note}"))
+            break
+
+    for word in vocab["openers"]:
+        for m in re.finditer(rf"(?:^|(?<=[.!?])\s+){re.escape(word)}\b", lowered, re.MULTILINE):
+            found.append(Finding(BLOCK, "banned-opener", line_of(masked, m.start()),
+                                 f"master §2 bans {word!r} as a sentence-opening transition."))
+            break
+
+    for phrase, source in vocab["phrases"]:
+        if phrase.lower() in exempt:
+            continue
+        placeholder = re.search(r"\b[XY]\b", phrase)
+        pattern = re.escape(phrase.lower())
+        if placeholder:
+            # The pattern was lowercased on the line above, so the placeholder is
+            # already x or y here. Matching [XY] found nothing and left every
+            # placeholder phrase as a literal, so none of them ever fired.
+            pattern = re.sub(r"\\ ?[xy]\b", r"[\\w' -]{2,30}", pattern)
+        try:
+            m = re.search(pattern, lowered)
+        except re.error:
+            continue
+        if m:
+            severity = WARN if placeholder else BLOCK
+            found.append(Finding(severity, "banned-phrase", line_of(masked, m.start()),
+                                 f"master §2: {source}"))
+    return found
+
+
+def check_structure(masked: str) -> list[Finding]:
+    found: list[Finding] = []
+
+    for number, raw in enumerate(masked.splitlines(), start=1):
+        m = re.match(r"^(#{1,6})\s+(.*)$", raw)
+        if not m:
+            continue
+        head = m.group(2).strip().rstrip("#").strip()
+        if not head:
+            continue
+        if head.endswith("?"):
+            found.append(Finding(BLOCK, "heading", number,
+                                 f"master §7.7: headings are noun phrases, not questions — {head!r}"))
+            continue
+        if VERDICT_HEAD.search(head):
+            found.append(Finding(BLOCK, "heading", number,
+                                 f"master §7.7: a comma plus a past participle reads as a verdict "
+                                 f"and deletes who judged and on what basis — {head!r}. State the "
+                                 f"claim in full or drop it."))
+            continue
+        if QUESTION_HEAD.match(head):
+            found.append(Finding(WARN, "heading", number,
+                                 f"master §7.7: heading opens as a question or instruction, "
+                                 f"use the noun form — {head!r}"))
+            continue
+        if head.endswith("."):
+            found.append(Finding(WARN, "heading", number,
+                                 f"master §7.7: heading reads as a sentence — {head!r}"))
+            continue
+        words = head.split()
+        first = words[0]
+        # "Messaging hierarchy" and "Pricing research" are noun phrases that
+        # happen to start in -ing. "Setting exit conditions" is the banned
+        # form, and it runs longer.
+        if len(words) > 2 and first.lower().endswith("ing") and len(first) > 5:
+            found.append(Finding(WARN, "heading", number,
+                                 f"master §7.7: gerund heading, use the noun form — {head!r}"))
+        elif SENTENCE_HEAD.search(head) or INFINITIVE_HEAD.search(head):
+            found.append(Finding(WARN, "heading", number,
+                                 f"master §7.7: heading carries a verb — {head!r}"))
+
+    # A bold-only line sitting directly above a heading is a kicker: two
+    # headings carrying one idea (master §7.7).
+    lines = masked.splitlines()
+    for number, raw in enumerate(lines, start=1):
+        if not BOLD_ONLY.match(raw):
+            continue
+        for nxt in lines[number:]:
+            if not nxt.strip():
+                continue
+            if re.match(r"^#{1,6}\s+\S", nxt):
+                found.append(Finding(BLOCK, "heading", number,
+                                     f"master §7.7: kicker stacked above a heading — "
+                                     f"{raw.strip()!r}. Keep it only if it carries what the "
+                                     f"heading does not, such as a number or a section name."))
+            break
+
+    blocks = prose_blocks(masked)
+
+    for start_line, paragraph, is_item in blocks:
+        count = count_sentences(paragraph)
+        if count > 3:
+            where = "list item" if is_item else "paragraph"
+            fix = "Split the item." if is_item else "Use a list or table."
+            found.append(Finding(BLOCK, "paragraph", start_line,
+                                 f"master §7.8: prose caps at three sentences, this {where} has "
+                                 f"{count}. {fix}"))
+
+    # Only asides inside running prose count. An em-dash separating a term
+    # from its definition in a list or table is the house style, not the
+    # contrast tic §2 bans.
+    prose = " ".join(body for _, body, is_item in blocks if not is_item)
+    words = len(prose.split())
+    dashes = prose.count("—")
+    allowed = max(1, round(words / 500))
+    if dashes > allowed:
+        found.append(Finding(WARN, "em-dash", 0,
+                             f"master §2: at most one em-dash aside per ~500 words of prose. "
+                             f"Found {dashes} across {words} words (allowed {allowed})."))
+
+    for m in LITOTES.finditer(masked):
+        found.append(Finding(BLOCK, "litotes", line_of(masked, m.start()),
+                             f"master §2 bans litotes — say the thing, not its opposite denied: "
+                             f"{m.group(0)!r}"))
+        break
+
+    if blocks:
+        last_line, last, _ = blocks[-1]
+        if CLOSER_OPENERS.match(last):
+            found.append(Finding(BLOCK, "closer", last_line,
+                                 "master §2 and §7.5: end on the last substantive point, "
+                                 "no summary paragraph."))
+        m = SIGN_OFF.search(last)
+        if m:
+            found.append(Finding(BLOCK, "closer", last_line,
+                                 f"master §7.5: no sign-off or offer of further help inside a "
+                                 f"deliverable — {m.group(0)!r}"))
+    return found
+
+
+def check_acronyms(masked: str) -> list[Finding]:
+    found: list[Finding] = []
+    seen: set[str] = set()
+    for m in re.finditer(r"\b([A-Z]{2,6})s?\b", masked):
+        token = m.group(1)
+        if token in ACRONYM_OK or token in seen:
+            continue
+        # Part of a filename (CLAUDE.md, SKILL.md), not an acronym in prose.
+        if re.match(r"\.[A-Za-z]{1,5}\b", masked[m.end():m.end() + 6]):
+            continue
+        seen.add(token)
+        glossed = (
+            re.search(rf"\({re.escape(token)}s?\)", masked)
+            or re.search(rf"\b{re.escape(token)}s?\s*\([a-z]", masked)
+            or re.search(rf"\b{re.escape(token)}s?\s*[—-]\s*[a-z]", masked)
+        )
+        if glossed:
+            continue
+        found.append(Finding(WARN, "acronym", line_of(masked, m.start()),
+                             f"master §1.6: gloss {token!r} in a few words on first use, "
+                             f"or spell it out."))
+    return found
+
+
+def is_reference(path: Path, root: Path | None) -> bool:
+    """Teaching material, where figures are worked examples rather than facts.
+
+    `docs/` is not on this list: in an ordinary repo it is where a deliverable
+    lands, and .md is the working format, so exempting it silently drops the
+    check on the most likely path of all.
+    """
+    parts = Path(relative(path, root).replace("\\", "/")).parts
+    if not parts:
+        return False
+    if parts[0] == ".claude":
+        return True
+    return parts[0] == "skills-library" and is_home_repo(root)
+
+
+def check_ledger(path: Path, masked: str, root: Path | None) -> list[Finding]:
+    if root is None or is_reference(path, root):
+        return []
+    figures = {m.group(0) for m in FIGURE.finditer(masked)}
+    if len(figures) < 3:
+        return []
+    # A --private install lands as CLAUDE.local.md beside the target's own
+    # tracked CLAUDE.md, and §3.2 puts the ledger in the bundle's file. Reading
+    # only CLAUDE.md turns this check off in exactly the repos Alex does not
+    # own, where the figures are someone else's money.
+    local = root / "CLAUDE.local.md"
+    declaring = local if local.is_file() else root / "CLAUDE.md"
+    if not declaring.is_file():
+        return []
+    declared = read_text(declaring)
+    if declared is None:
+        return []
+    if "Ledger" not in declared:
+        return [Finding(WARN, "ledger", 0,
+                        f"master §3.2: {declaring.name} declares no ledger line, so the §3.3 "
+                        f"check cannot run on {len(figures)} material figures here.")]
+    pool = declared
+    ledger_file = root / "ledger.md"
+    if ledger_file.is_file():
+        extra = read_text(ledger_file)
+        if extra is not None:
+            pool += extra
+    entries = "\n".join(line for line in pool.splitlines() if LEDGER_ENTRY.match(line))
+    recorded = {m.group(0).lower().replace(" ", "") for m in FIGURE.finditer(entries)}
+    missing = sorted(f for f in figures if f.lower().replace(" ", "") not in recorded)
+    if not missing:
+        return []
+    sample = ", ".join(missing[:4])
+    # Whether a figure is material is §3.1's cost test, which a regex cannot
+    # run — so warn, never block (master §9.5), the same call check_filename
+    # makes. Matching figure by figure also closes the bypass where one
+    # unrelated dated bullet satisfied the gate for that repo forever.
+    return [Finding(WARN, "ledger", 0,
+                    f"master §3.3: {len(missing)} figure(s) here are not in the ledger "
+                    f"({sample}{' …' if len(missing) > 4 else ''}). If any is material — would "
+                    f"it cost something to be wrong? — record it as "
+                    f"'- [YYYY-MM-DD] subject — fact (source)' before first use.")]
+
+
+# --------------------------------------------------------------------------
+# Driving
+# --------------------------------------------------------------------------
+
+def relative(path: Path, root: Path | None) -> str:
+    if root is None:
+        return path.name
+    try:
+        return str(path.resolve().relative_to(root.resolve()))
+    except ValueError:
+        return path.name
+
+
+def is_home_repo(root: Path | None) -> bool:
+    # Matched by shape, not by version: a v8 master must not silently turn the
+    # home repo into an ordinary one.
+    return root is not None and any((root / "master").glob("claude-master-*.md"))
+
+
+def is_rule_file(path: Path, root: Path | None) -> bool:
+    rel = relative(path, root).replace("\\", "/")
+    if rel in RULE_FILES:
+        return True
+    parts = Path(rel).parts
+    if any(part in RULE_DIRS for part in parts):
+        return True
+    return bool(parts) and parts[0] in HOME_ONLY_DIRS and is_home_repo(root)
+
+
+def is_memory_file(path: Path, root: Path | None) -> bool:
+    """A memory-graph domain file, which §6.3 exempts from §7.7 headings."""
+    parts = Path(relative(path, root).replace("\\", "/")).parts
+    return bool(parts) and parts[0] == "memory" and is_home_repo(root)
+
+
+def check(path: Path, content: str, root: Path | None) -> list[Finding]:
+    if path.suffix.lower() not in PROSE_SUFFIXES:
+        return []
+    if is_rule_file(path, root):
+        return []
+    masked = mask(content)
+    vocab = load_vocabulary(root)
+    findings = check_filename(path, root)
+    # A partial load checks part of the list and reports clean on the rest, so
+    # the floor is per-section, not "both lists empty".
+    thin = [name for name, least in VOCAB_FLOOR.items() if len(vocab[name]) < least]
+    if thin:
+        findings.append(Finding(BLOCK, "hook", 0,
+                                f"the writing-standards skill loaded short ({', '.join(thin)}), "
+                                f"so §2 is not being checked for this write. "
+                                f"Run predelivery.py --selftest."))
+    findings += check_vocabulary(content, masked, vocab)
+    structure = check_structure(masked)
+    # A memory node's heading is a sentence on purpose (master §6.3): a noun
+    # phrase would name the topic where the reader needs the finding. Warning on
+    # every node write would teach the session to ignore this hook, so §7.7 is
+    # dropped for the graph and every other structure rule still applies.
+    if is_memory_file(path, root):
+        structure = [f for f in structure if f.rule != "heading"]
+    findings += structure
+    # Glossing applies to deliverables Alex reads, not to reference material
+    # where the domain terms are the subject. The ledger gate keys off the
+    # figures in the text, so it runs everywhere.
+    if DATE_PREFIX.match(path.name) or BAD_DATE_PREFIX.match(path.name):
+        findings += check_acronyms(masked)
+    findings += check_ledger(path, masked, root)
+    return findings
+
+
+def payload_to_target(payload: dict) -> tuple[Path, str] | None:
+    tool = payload.get("tool_name", "")
+    tool_input = payload.get("tool_input") or {}
+    raw_path = tool_input.get("file_path")
+    if not raw_path:
+        return None
+    path = Path(raw_path)
+    if tool == "Write":
+        return path, tool_input.get("content", "")
+    if tool == "Edit":
+        original = read_text(path)
+        if original is None:
+            return None
+        old = tool_input.get("old_string", "")
+        new = tool_input.get("new_string", "")
+        if not old:
+            return None
+        if tool_input.get("replace_all"):
+            return path, original.replace(old, new)
+        return path, original.replace(old, new, 1)
+    if tool == "MultiEdit":
+        content = read_text(path)
+        if content is None:
+            return None
+        for edit in tool_input.get("edits") or []:
+            old = edit.get("old_string", "")
+            new = edit.get("new_string", "")
+            if not old:
+                continue
+            content = (content.replace(old, new) if edit.get("replace_all")
+                       else content.replace(old, new, 1))
+        return path, content
+    return None
+
+
+def run_hook() -> int:
+    try:
+        payload = json.load(sys.stdin)
+    except (json.JSONDecodeError, ValueError):
+        return 0
+    target = payload_to_target(payload)
+    if target is None:
+        return 0
+    path, content = target
+    root = find_repo_root(path.parent if path.parent.exists() else Path.cwd())
+    findings = check(path, content, root)
+
+    # Only what this write introduces may deny. A file's existing breaks belong
+    # to whoever wrote them — §2 exempts words Claude did not choose, and
+    # denying an unrelated one-line edit because a target's own maintainers
+    # wrote "innovative" three paragraphs away teaches a session to route
+    # around the hook entirely. Pre-existing breaks still surface as warnings.
+    before = read_text(path)
+    if before is not None and before != content:
+        prior = {(f.rule, f.message) for f in check(path, before, root)}
+        for finding in findings:
+            # "the skill loaded short" is a fact about this write, not a break
+            # the file's author owns. It is content-independent, so it sits in
+            # `prior` on every edit and would demote itself out of existence —
+            # cancelling the one guard that stops work when §2 is unenforced.
+            if finding.rule == "hook":
+                continue
+            if finding.severity == BLOCK and (finding.rule, finding.message) in prior:
+                finding.severity = WARN
+
+    if not findings:
+        return 0
+
+    rel = relative(path, root)
+    blocking = [f for f in findings if f.severity == BLOCK]
+    warnings = [f for f in findings if f.severity == WARN]
+
+    if blocking:
+        lines = [f"Pre-delivery check failed for {rel} — fix these, then write again:", ""]
+        lines += [f.render(rel) for f in blocking]
+        if warnings:
+            lines += ["", "Also worth a look:"]
+            lines += [f.render(rel) for f in warnings]
+        reason = "\n".join(lines)
+        print(json.dumps({
+            "hookSpecificOutput": {
+                "hookEventName": "PreToolUse",
+                "permissionDecision": "deny",
+                "permissionDecisionReason": reason,
+            },
+            "systemMessage": f"Pre-delivery check blocked {rel} ({len(blocking)} rule breaks).",
+        }))
+        return 0
+
+    note = "\n".join([f"Pre-delivery warnings for {rel}:"] + [f.render(rel) for f in warnings])
+    print(json.dumps({
+        "systemMessage": note,
+        "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "additionalContext": note,
+        },
+    }))
+    return 0
+
+
+def run_files(paths: list[str]) -> int:
+    worst = 0
+    for name in paths:
+        path = Path(name)
+        content = read_text(path)
+        if content is None:
+            print(f"{name}: cannot read", file=sys.stderr)
+            worst = max(worst, 1)
+            continue
+        root = find_repo_root(path.parent.resolve())
+        findings = check(path, content, root)
+        rel = relative(path, root)
+        if not findings:
+            print(f"ok   {rel}")
+            continue
+        blocking = [f for f in findings if f.severity == BLOCK]
+        print(f"{'FAIL' if blocking else 'warn'} {rel}")
+        for finding in findings:
+            marker = "BLOCK" if finding.severity == BLOCK else " warn"
+            print(f"  {marker}{finding.render(rel)[1:]}")
+        if blocking:
+            worst = 1
+    return worst
+
+
+def run_selftest() -> int:
+    """Confirm the rules actually loaded. A silent empty load checks nothing."""
+    vocab = load_vocabulary(find_repo_root(Path(__file__).resolve().parent))
+    ok = True
+    for name, want in VOCAB_FLOOR.items():
+        got = len(vocab[name])
+        status = "ok" if got >= want else "LOW"
+        if got < want:
+            ok = False
+        print(f"  {status:3} {name:9} {got:>3} (expected at least {want})")
+    if not ok:
+        print("predelivery selftest FAILED: the writing-standards skill did not load "
+              "or its sections have moved. Vocabulary enforcement is off.", file=sys.stderr)
+        return 1
+    print("predelivery selftest passed")
+    return 0
+
+
+def main() -> int:
+    args = sys.argv[1:]
+    if args and args[0] == "--hook":
+        return run_hook()
+    if args and args[0] == "--selftest":
+        return run_selftest()
+    if not args:
+        print(__doc__)
+        return 0
+    return run_files(args)
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except Exception as exc:  # fail open: never wedge a session
+        if "--hook" in sys.argv:
+            # Fail open, but never in silence: a crash that reads as a clean
+            # pass is the failure mode this whole checker exists to avoid.
+            print(json.dumps({"systemMessage":
+                              f"pre-delivery check crashed ({exc!r}) — enforcement is off "
+                              f"for this write (master §9.5)"}))
+            sys.exit(0)
+        print(f"predelivery: internal error: {exc}", file=sys.stderr)
+        sys.exit(0)
