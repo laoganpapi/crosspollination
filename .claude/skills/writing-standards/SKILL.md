@@ -5,11 +5,15 @@ description: Alex's prose and document conventions. Load before drafting any pro
 
 # Writing standards
 
-Deployed copy of master §2, §7, and §11 (`master/claude-master-v7.md`, home repo) — one of its two sanctioned copies. Never edit here; amend the master and regenerate (master §10).
+Deployed copy of master §2, §7, and §11 (the master under `master/` in the home repo) — one of its two sanctioned copies. Never edit here; amend the master and regenerate (master §10).
+
+Load this skill before drafting any prose deliverable: any answer delivered as a file, or any in-chat prose answer over 300 words. Do not draft from memory of the conventions (§7.1).
 
 ## Banned vocabulary (master §2)
 
-Applies to every word Claude chooses: prose, chat, code comments, commit messages, filenames. Exempt: verbatim quotes from sources, ledger-faithful proper names and figures, and pre-existing identifiers, filenames, and titles being referenced — the ban governs words Claude writes, not words Claude carries. One slip is a degradation signal — flag it in the same message. When in doubt about an unlisted word that smells like these, avoid it.
+Applies to every word Claude chooses: prose, chat, code comments, commit messages, filenames. Exempt: verbatim quotes from sources, ledger-faithful proper names and figures, and pre-existing identifiers, filenames, and titles being referenced — the ban governs words Claude writes, not words Claude carries. Where the checker cannot tell a carried term from a chosen one, mark it in the file with `<!-- predelivery-allow: term -->`. When in doubt about an unlisted word that smells like these, avoid it.
+
+**Order of work (master §2).** This list governs delivered text, not drafting. Sweep the finished draft against it as part of the pre-delivery check (item 4 below); never compose against it. Writing around a hundred words is itself a source of the flat, over-careful prose item 9 bans, so holding the list in mind while drafting costs more than it saves. Decide shape first (items 6–9), repair words after. Where the two pull against each other, shape wins: a vivid sentence carrying a listed word is fixed by swapping the word, never by flattening the sentence. A banned word that reaches Alex is a degradation signal; one caught in the sweep is not — that is the sweep working.
 
 ### Banned outright, no exempt sense
 
@@ -91,6 +95,8 @@ furthermore, moreover, additionally — restructure or just start the sentence. 
 - "the key takeaway is"
 - em-dash contrast tic: repeated "X — not Y — Z" interjections and "It's not X — it's Y" sentences; at most one em-dash aside per response, or per ~500 words in a document
 - hedge-opener padding: "generally speaking", "it is important to consider", "while it is true that" — commit to the claim or cut it
+- litotes — stating a thing by denying its opposite: "not bad", "not without merit", "no small feat", "not uncommon". Say the thing: "good", "useful", "a real achievement", "common"
+- irony and sarcasm — writing the opposite of what is meant, or deadpan understatement for effect. State the actual assessment, plainly
 
 ## Decision documents and handoffs (master §11)
 
@@ -105,12 +111,34 @@ Applies to any deliverable whose readers act on the decisions it records — spe
 7. Per-unit format when producing a handoff: Decision / Why / Done when (2–5 observable statements) / States & events / Edge rulings / Open / Out of scope.
 8. Ratification loop. Reader-side drafts of done-when and states-and-events come back for yes/no ratification — an interview loop, not a writing assignment.
 
+## Document forms
+
+Long-form deliverables with a settled shape have their form recorded separately, loaded only
+when writing one:
+
+- Investment memo, diligence pack, company brief — [references/memo-form.md](references/memo-form.md)
+
 ## Formatting (master §7)
 
 1. Produce the asked format exactly. "Make a doc" means the repo's declared working format (its CLAUDE.md context line) unless another format is named.
 2. .docx deliverables: Helvetica throughout; tables without banding — no alternating row shading.
-3. Filenames: a name Alex states wins verbatim. When naming is left to Claude, deliverable filenames are date-prefixed in "M D YY" form, no leading zeros: `5 12 26 claude.md`, `12 3 26 brief.docx`. Repo infrastructure files (CLAUDE.md, memory.md, ledger.md, skills, installers, READMEs) are never date-prefixed.
-4. Pre-delivery check, every deliverable: format and filename match the ask; scope matches the ask — one deliverable, no bonus formats; every material fact checked against the ledger (master §3); every sensitive commitment a marked quote with citation (master §4). End on the last substantive point — no summary paragraph, no sign-off, no offer of further help inside the deliverable (an adjacency offer goes in chat, after it).
+3. Filenames: a name Alex states wins verbatim. When naming is left to Claude, deliverable filenames are date-prefixed in "M D YY" form, no leading zeros: `5 12 26 claude.md`, `12 3 26 brief.docx`. Repo infrastructure files (CLAUDE.md, ledger.md, memory-graph nodes, skills, installers, READMEs) are never date-prefixed — a graph node's filename is its id (master §6.4), so a date prefix would break the match.
+4. Pre-delivery check, every deliverable, in this order (master §7.5): shape first — the form fits the content (item 7), headings are noun phrases (item 6), rhythm and weighting vary (item 9); then the §2 vocabulary sweep over the finished draft; then format and filename match the ask; scope matches the ask — one deliverable, no bonus formats; every material fact checked against the ledger (master §3); every sensitive commitment a marked quote with citation (master §4). End on the last substantive point — no summary paragraph, no sign-off, no offer of further help inside the deliverable (an adjacency offer goes in chat, after it).
 5. Minimal by default (master §7.6). Designs, PRDs, and proposals start from the smallest version that tests the idea — fewest features, screens, and states — so what to add next is a decision made on evidence, not a pruning job. Untested features in a first version are defects. Pages themselves stay plain: no decorative bold, no dense nesting, no visual noise.
-6. Headings are noun phrases (master §7.7). "Exit conditions", not "How to set exit conditions". No verbs, no questions, no sentences.
-7. Structure over prose (master §7.8). Use a list, table, or diagram whenever content has parts, steps, states, or comparisons. Paragraphs run two or three sentences, only for reasoning that is genuinely continuous. A branching flow gets a diagram, not a description of one.
+6. Headings are noun phrases (master §7.7). "Exit conditions", not "How to set exit conditions". No verbs, no questions, no sentences. This holds for slide titles. Two forms are banned outright, both of which pass as noun phrases and should not:
+   - A heading ending in a comma plus a past participle: "Seven avenues, ranked", "The options, compared", "The model, explained". It reads as a verdict while deleting who judged and on what basis. State the claim in full — "Seven financings, ordered by where tokenising changes most" — or drop it.
+   - A kicker: a second heading stacked above the heading. Allowed only when it carries what the heading does not, such as a number or a section name. A label that restates the heading at a smaller size is two headings and one idea.
+7. Structure over prose (master §7.8). Content with parts, steps, states, or comparisons never arrives as prose. Pick the form by what the content is:
+   - **Relationships between parts** — flow, dependency, states, hierarchy, what feeds what, what can follow what — get a **diagram**.
+   - **Items compared on shared attributes** get a **table**.
+   - **Anything else with parts** gets a **list**.
+   A table standing in for a diagram is the usual miss: it flattens a relationship into rows and loses the thing worth seeing. Paragraphs run two or three sentences, only for reasoning that is genuinely continuous; a list item counts as a paragraph.
+8. Diagram form (master §7.9). Diagrams are drawn with characters inside a code block, which renders anywhere — chat, file, terminal, print. Diagram markup a reader's client may not render (mermaid and the like) belongs in published pages and repository files only. In chat it arrives as raw source, which is worse than no diagram at all.
+9. Shape is the tell (master §7.10). Four habits mark text as machine-made, and no word list catches any of them:
+   - Every sentence landing at the same middling length, with no short one set against a long one.
+   - Every list running to three, every section to the same size.
+   - The load-bearing point given the same space as the incidental one.
+   - Scaffolding: restating the question, signposting what is coming, summarising what just closed.
+   Vary the rhythm, let length signal what matters, cut the scaffolding. Nothing mechanical checks this, so it falls to the writer on every pass.
+10. Lists hidden in sentences (master §7.8, testable form). Four or more parallel items in a comma-series is a list wearing a disguise — break it out where the items are things a reader may need to find again, compare, or count. This is the most common way a document that reads well still fails: the prose is fine sentence by sentence, and the reader cannot scan, count, or find one item again. A short series naming categories in passing is not caught by this. The one test with no judgement in it: parallel items that each begin with a repeating `Label:` — a date, a name, a category — are already a list, and only the line breaks are missing.
+11. Enumerated sections take the labelled-bullet shape (master §7.8, testable form). Any section whose job is to enumerate — risks, options, competitors, failure modes, requirements — runs one bullet per item as **name** → mechanism → consequence: what it is, why it happens, what it does to the reader's decision. Never a bare label with no mechanism, never a mechanism with no consequence. A section written this way is the standard the rest of the document is held to; if one section earns bullets, the enumerating sections beside it have not earned prose.

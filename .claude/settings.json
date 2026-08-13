@@ -1,0 +1,17 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Write|Edit|MultiEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sh -c 'd=\"$PWD\"; while [ \"$d\" != / ] && [ ! -f \"$d/.claude/hooks/predelivery.py\" ]; do d=$(dirname \"$d\"); done; f=\"$d/.claude/hooks/predelivery.py\"; [ -f \"$f\" ] || f=\"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/predelivery.py\"; if [ ! -f \"$f\" ] || ! command -v python3 >/dev/null 2>&1; then printf \"%s\" \"{\\\"systemMessage\\\":\\\"pre-delivery check did not run \u2014 no .claude/hooks/predelivery.py at or above $PWD and none under ${CLAUDE_PROJECT_DIR:-.}, or python3 unavailable; enforcement is off for this write (master \u00a79.5)\\\"}\"; exit 0; fi; python3 \"$f\" --hook'",
+            "timeout": 20,
+            "statusMessage": "Pre-delivery check"
+          }
+        ]
+      }
+    ]
+  }
+}
