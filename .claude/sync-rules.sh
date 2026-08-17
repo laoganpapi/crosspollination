@@ -45,6 +45,29 @@ for rel in $(printf '%s\n' "$MANIFEST" | sed -e 's/#.*//' -e '/^[[:space:]]*$/d'
   changed="$changed $rel"
 done
 
+# Session settings the kit owns, merged rather than copied: a repo's settings.json
+# also carries its hooks and anything that repo added, and those must survive.
+#
+# The hooks are merged here too, and that is the whole point of this block.
+# install.sh wired them once at install time and nothing ever re-ran it, so the
+# kit's files kept arriving here while `hooks` was left alone: measured
+# 2026-08-14 across Republic-Work, Venture-Deals, Nous and Fih, every one of
+# them carrying feedback.py on disk with nothing calling it. A merge the
+# session-start path performs itself needs nothing re-run.
+#
+# One implementation, fetched rather than copied, so this and install.sh cannot
+# drift into disagreeing about what a repo should carry.
+kit="$(mktemp -d)" && trap 'rm -rf "$kit"' EXIT
+if [ -n "${kit:-}" ] && [ -d "$kit" ] \
+   && fetch install/merge-settings.py       > "$kit/merge.py" \
+   && fetch .claude/settings.json           > "$kit/settings.json" \
+   && fetch install/settings-fragment.json  > "$kit/fragment.json" \
+   && [ -s "$kit/merge.py" ] && [ -s "$kit/settings.json" ] && [ -s "$kit/fragment.json" ]; then
+  merged="$(python3 "$kit/merge.py" "$ROOT/.claude/settings.json" \
+              "$kit/settings.json" "$kit/fragment.json" 2>/dev/null)" || merged=""
+  [ -n "$merged" ] && changed="$changed settings.json($merged)"
+fi
+
 [ -z "$changed" ] && exit 0
 
 rules="$ROOT/.claude/universal.md"

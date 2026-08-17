@@ -24,6 +24,11 @@ import re
 import sys
 from pathlib import Path
 
+# How much of the transcript tail to read in --stop mode. One turn is far
+# smaller than this; reading the whole file costs tens of milliseconds on a
+# session that has run for hours, and buys nothing.
+TAIL_BYTES = 256 * 1024
+
 BLOCK = "block"
 WARN = "warn"
 
@@ -122,12 +127,52 @@ INFINITIVE_HEAD = re.compile(
     r"start|ship|pick|choose|decide|read|write|send|take|keep|check|handle)\b",
     re.I,
 )
+# "Design for the machine path" is an instruction; "Design decisions" is a noun
+# phrase, and both open with the same word. The second token separates them: an
+# imperative is followed by a determiner, preposition or pronoun, while a noun
+# phrase is followed by its noun. Narrow on purpose — it under-reports rather
+# than firing on a legitimate heading, since a checker that cries wolf on good
+# headings gets routed around.
+IMPERATIVE_VERBS = (
+    "design|read|learn|enter|unify|give|treat|build|close|frame|prompt|curate|exploit|"
+    "evaluate|optimize|optimise|use|make|set|run|get|know|watch|ask|say|avoid|fix|start|"
+    "ship|pick|choose|decide|write|send|take|keep|check|handle|add|remove|delete|create|"
+    "define|record|report|review|test|verify|measure|track|plan|draft|send|store|load|"
+    "install|configure|deploy|monitor|scale|reduce|increase|improve|protect|prevent|"
+    "ensure|confirm|collect|gather|apply|adopt|follow|stop|begin|finish|prepare|manage"
+)
+IMPERATIVE_FOLLOWERS = (
+    "a|an|the|your|our|their|its|his|her|my|every|each|all|any|some|this|that|these|those|"
+    "for|before|after|when|while|with|by|to|from|into|in|on|at|through|toward|towards|"
+    "against|about|across|around|over|under|it|them|us|me|him|why|how|what|where"
+)
+# -ing words that are ordinary nouns rather than gerunds taking an object.
+NOUN_ING = {
+    "monitoring", "training", "sampling", "positioning", "pricing", "messaging",
+    "engineering", "funding", "marketing", "planning", "reporting", "testing",
+    "tooling", "onboarding", "forecasting", "accounting", "underwriting",
+    "servicing", "staking", "hedging", "clearing", "netting", "backtesting",
+    "logging", "tracing", "caching", "routing", "sharding", "streaming",
+    "batching", "learning", "reasoning", "grounding", "banking", "lending",
+    "borrowing", "settlement", "wording", "framing", "packaging", "branding",
+}
+IMPERATIVE_HEAD = re.compile(
+    rf"^(?:\d+[.)]\s*)?(?:{IMPERATIVE_VERBS})\s+(?:{IMPERATIVE_FOLLOWERS})\b",
+    re.I,
+)
 
 
 class Finding:
-    __slots__ = ("severity", "rule", "line", "message")
+    __slots__ = ("severity", "rule", "line", "message", "span")
 
-    def __init__(self, severity: str, rule: str, line: int, message: str) -> None:
+    def __init__(self, severity: str, rule: str, line: int, message: str,
+                 span: str = "") -> None:
+        # What was actually wrong, not just what kind of thing was wrong. The
+        # demotion below keys on it: without a span, a second four-sentence
+        # paragraph produced a message byte-identical to the first one's and was
+        # demoted to a warning, so adding a new break of a class the file already
+        # carried went unblocked.
+        self.span = span
         self.severity = severity
         self.rule = rule
         self.line = line
@@ -320,21 +365,23 @@ def mask(text: str) -> str:
     # scanner then joins its closing quote to the next term's opening quote,
     # blanking every rule out of the prose between them. Pairing in order
     # cannot skip a quote. A blank line inside means the quote never closed.
-    # Scanned against what is left after the blanking above, never the original.
-    # A stray double quote inside a code fence is already gone by here; counting
-    # it anyway shifted the pairing by one, so a real opening quote paired with a
-    # code-fence quote and every rule stopped applying to the prose between them.
-    so_far = "".join(out)
-    straight = [m.start() for m in re.finditer(r"\"", so_far)]
+    # Scan what has already been masked, not the original. Code fences, inline
+    # spans and links are blanked by this point, so a stray quote inside one —
+    # an `awk -F"` line, a shell string — can no longer pair with a real opening
+    # quote in the prose and blank everything between them. That bug turned a
+    # legitimate §4 citation into an unquoted commitment. Two sessions found and
+    # fixed this independently on 2026-08-13, with the same fix.
+    partial = "".join(out)
+    straight = [m.start() for m in re.finditer(r"\"", partial)]
     for start, end in zip(straight[0::2], straight[1::2]):
-        if "\n\n" not in text[start:end]:
+        if "\n\n" not in partial[start:end]:
             blank(start, end + 1)
     open_at = None
-    for m in re.finditer(r"[“”]", so_far):
+    for m in re.finditer(r"[“”]", partial):
         if m.group(0) == "“" and open_at is None:
             open_at = m.start()
         elif m.group(0) == "”" and open_at is not None:
-            if "\n\n" not in text[open_at:m.end()]:
+            if "\n\n" not in partial[open_at:m.end()]:
                 blank(open_at, m.end())
             open_at = None
     return "".join(out)
@@ -481,9 +528,10 @@ def check_vocabulary(text: str, masked: str, vocab: dict) -> list[Finding]:
         placeholder = re.search(r"\b[XY]\b", phrase)
         pattern = re.escape(phrase.lower())
         if placeholder:
-            # The pattern was lowercased on the line above, so the placeholder is
-            # already x or y here. Matching [XY] found nothing and left every
-            # placeholder phrase as a literal, so none of them ever fired.
+            # `pattern` is built from the LOWERCASED phrase, so the placeholder
+            # is `x`/`y` by the time it gets here. Matching `[XY]` left every
+            # placeholder pattern byte-identical to a literal, and all twelve of
+            # them matched nothing at all until 2026-08-13.
             pattern = re.sub(r"\\ ?[xy]\b", r"[\\w' -]{2,30}", pattern)
         try:
             m = re.search(pattern, lowered)
@@ -496,7 +544,7 @@ def check_vocabulary(text: str, masked: str, vocab: dict) -> list[Finding]:
     return found
 
 
-def check_structure(masked: str) -> list[Finding]:
+def check_structure(masked: str, prose_cap: int = 3) -> list[Finding]:
     found: list[Finding] = []
 
     for number, raw in enumerate(masked.splitlines(), start=1):
@@ -530,9 +578,28 @@ def check_structure(masked: str) -> list[Finding]:
         # "Messaging hierarchy" and "Pricing research" are noun phrases that
         # happen to start in -ing. "Setting exit conditions" is the banned
         # form, and it runs longer.
-        if len(words) > 2 and first.lower().endswith("ing") and len(first) > 5:
+        gerund = len(words) > 2 and first.lower().endswith("ing") and len(first) > 5
+        # Some -ing words are ordinary nouns in these subjects, and a heading
+        # built on one is a noun phrase already: "Monitoring and observability",
+        # "Training data — what a model learns from". Coordination is the other
+        # tell: a gerund taking an object never reads "X and Y".
+        second = words[1].lower().strip(",:;") if len(words) > 1 else ""
+        # A determiner or possessive after the -ing word means it is taking an
+        # object, which is the banned form however ordinary the word is as a
+        # noun: "Planning an AI application" fires, "Planning horizon" does not.
+        takes_object = second in ("a", "an", "the", "your", "our", "its", "their",
+                                  "his", "her", "my", "what", "how", "which",
+                                  "this", "that", "these", "those")
+        if gerund and not takes_object and (first.lower().strip(",:—-") in NOUN_ING
+                                            or second in ("and", "or")):
+            gerund = False
+        if gerund:
             found.append(Finding(WARN, "heading", number,
                                  f"master §7.7: gerund heading, use the noun form — {head!r}"))
+        elif IMPERATIVE_HEAD.match(head):
+            found.append(Finding(WARN, "heading", number,
+                                 f"master §7.7: heading is an instruction, not a noun phrase — "
+                                 f"{head!r}. Name the thing, not the action."))
         elif SENTENCE_HEAD.search(head) or INFINITIVE_HEAD.search(head):
             found.append(Finding(WARN, "heading", number,
                                  f"master §7.7: heading carries a verb — {head!r}"))
@@ -557,12 +624,15 @@ def check_structure(masked: str) -> list[Finding]:
 
     for start_line, paragraph, is_item in blocks:
         count = count_sentences(paragraph)
-        if count > 3:
+        if count > prose_cap:
             where = "list item" if is_item else "paragraph"
             fix = "Split the item." if is_item else "Use a list or table."
+            written = "two" if prose_cap == 2 else "three"
+            rule = "§1.3a" if prose_cap == 2 else "§7.8"
             found.append(Finding(BLOCK, "paragraph", start_line,
-                                 f"master §7.8: prose caps at three sentences, this {where} has "
-                                 f"{count}. {fix}"))
+                                 f"master {rule}: prose caps at {written} sentences, this "
+                                 f"{where} has {count}. {fix}",
+                                 span=" ".join(paragraph.split())[:60]))
 
     # Only asides inside running prose count. An em-dash separating a term
     # from its definition in a list or table is the house style, not the
@@ -695,7 +765,9 @@ def relative(path: Path, root: Path | None) -> str:
 def is_home_repo(root: Path | None) -> bool:
     # Matched by shape, not by version: a v8 master must not silently turn the
     # home repo into an ordinary one.
-    return root is not None and any((root / "master").glob("claude-master-*.md"))
+    # The rules moved into the graph on 2026-08-14; the home repo is the one
+    # that holds them.
+    return root is not None and (root / "memory" / "rules.md").is_file()
 
 
 def is_rule_file(path: Path, root: Path | None) -> bool:
@@ -714,14 +786,50 @@ def is_memory_file(path: Path, root: Path | None) -> bool:
     return bool(parts) and parts[0] == "memory" and is_home_repo(root)
 
 
+WORD_BUDGET = {
+    ".claude/universal.md": 2600,
+    "CLAUDE.md": 200,
+}
+
+
+def check_budget(path: Path, content: str, root: Path | None) -> list[Finding]:
+    """Master §5.1a: the always-loaded rules are zero-sum.
+
+    Runs before the rule-file exemption below, deliberately. `check()` returns
+    early for rule files, so the one file whose growth is the problem is the one
+    file nothing was watching. This is measured in words, not lines: a line cap
+    is defeated by writing longer lines, which is exactly what happened.
+    """
+    rel = relative(path, root).replace("\\", "/")
+    budget = WORD_BUDGET.get(rel)
+    if budget is None:
+        return []
+    # The 200-word cap is on the CLAUDE.md this system installs, and that file
+    # lives in the fifteen target repos, not here — where it was the only place
+    # the check ran. The bundle's copy is the one carrying the universal.md
+    # import; a repo's own CLAUDE.md is flagged, never trimmed (§5.1), so it is
+    # left to the home-repo path.
+    ours = "@.claude/universal.md" in content
+    if not is_home_repo(root) and not ours:
+        return []
+    words = len(content.split())
+    if words <= budget:
+        return []
+    return [Finding(BLOCK, "budget", 0,
+                    f"master §5.1a: {rel} is {words} words against a budget of {budget}. "
+                    f"The always-loaded rules are zero-sum — retire a rule to land one, or "
+                    f"raise the budget with Alex (§10). Do not trim silently.")]
+
+
 def check(path: Path, content: str, root: Path | None) -> list[Finding]:
     if path.suffix.lower() not in PROSE_SUFFIXES:
         return []
+    budget = check_budget(path, content, root)
     if is_rule_file(path, root):
-        return []
+        return budget
     masked = mask(content)
     vocab = load_vocabulary(root)
-    findings = check_filename(path, root)
+    findings = budget + check_filename(path, root)
     # A partial load checks part of the list and reports clean on the rest, so
     # the floor is per-section, not "both lists empty".
     thin = [name for name, least in VOCAB_FLOOR.items() if len(vocab[name]) < least]
@@ -802,7 +910,7 @@ def run_hook() -> int:
     # around the hook entirely. Pre-existing breaks still surface as warnings.
     before = read_text(path)
     if before is not None and before != content:
-        prior = {(f.rule, f.message) for f in check(path, before, root)}
+        prior = {(f.rule, f.message, f.span) for f in check(path, before, root)}
         for finding in findings:
             # "the skill loaded short" is a fact about this write, not a break
             # the file's author owns. It is content-independent, so it sits in
@@ -810,7 +918,7 @@ def run_hook() -> int:
             # cancelling the one guard that stops work when §2 is unenforced.
             if finding.rule == "hook":
                 continue
-            if finding.severity == BLOCK and (finding.rule, finding.message) in prior:
+            if finding.severity == BLOCK and (finding.rule, finding.message, finding.span) in prior:
                 finding.severity = WARN
 
     if not findings:
@@ -846,6 +954,206 @@ def run_hook() -> int:
         },
     }))
     return 0
+
+
+def _turn_text(transcript_path: str) -> tuple[list[str], str | None]:
+    """Assistant text blocks written since the last real user turn.
+
+    The transcript is an undocumented internal format with no stability
+    guarantee, so every step here fails loudly rather than returning an empty
+    list, which would read as "nothing to check" and pass silently.
+    """
+    path = Path(transcript_path)
+    try:
+        size = path.stat().st_size
+        with path.open("rb") as handle:
+            if size > TAIL_BYTES:
+                handle.seek(size - TAIL_BYTES)
+                handle.readline()  # drop the partial line the seek landed in
+            raw = handle.read().decode("utf-8", errors="replace")
+    except OSError as exc:
+        return [], f"transcript unreadable: {exc}"
+
+    entries = []
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            entries.append(json.loads(line))
+        except ValueError:
+            continue
+    if not entries:
+        return [], "no parseable entries in the transcript tail"
+
+    def is_real_user(entry: dict) -> bool:
+        if entry.get("type") != "user" or entry.get("isSidechain") or entry.get("isMeta"):
+            return False
+        content = (entry.get("message") or {}).get("content")
+        if isinstance(content, list):
+            # A tool result is delivered as a user entry; it is not Alex speaking.
+            return not any(b.get("type") == "tool_result" for b in content)
+        return True
+
+    start = 0
+    for index in range(len(entries) - 1, -1, -1):
+        if is_real_user(entries[index]):
+            start = index + 1
+            break
+
+    blocks = []
+    for entry in entries[start:]:
+        if entry.get("type") != "assistant" or entry.get("isSidechain"):
+            continue
+        content = (entry.get("message") or {}).get("content")
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if block.get("type") == "text" and block.get("text", "").strip():
+                blocks.append(block["text"])
+    return blocks, None
+
+
+CHAT_PROSE_CAP = 2   # §1.3a, anything addressed to Alex directly
+FILE_PROSE_CAP = 3   # §7.8, a document written for someone else
+
+
+def chat_findings(text: str, vocab: dict) -> list[Finding]:
+    """What the chat gate checks. Named so a test can reach it.
+
+    The cap lived inline at the call site and was §7.8's three rather than
+    §1.3a's two — the gate ran one notch looser than the rule it cited, from the
+    day it shipped until 2026-08-13. A test that calls check_structure directly
+    cannot catch that; it has to go through whatever run_stop actually uses.
+    """
+    masked = mask(text)
+    return check_vocabulary(text, masked, vocab) + check_structure(masked, CHAT_PROSE_CAP)
+
+
+def run_stop() -> int:
+    """Stop-hook mode: check what this turn said to Alex before it reaches him.
+
+    Chat is the one surface the Write/Edit hook never sees. This closes it.
+
+    Blocks by returning `{"decision": "block"}` so the turn continues and the
+    message is rewritten. Exactly one retry: `stop_hook_active` is honoured, so
+    a second pass never blocks. A rewrite loop with no cap is the shape master
+    §13.4 bans and `field-notes.md` §1 already recorded at 55 cycles.
+
+    Anything that goes wrong prints a systemMessage and exits 0. A chat check
+    that cannot run must say so, never pass silently.
+    """
+    try:
+        payload = json.loads(sys.stdin.read() or "{}")
+    except ValueError:
+        print(json.dumps({"systemMessage": "chat check did not run: unreadable hook payload"}))
+        return 0
+
+    if payload.get("stop_hook_active"):
+        return 0  # one retry only
+
+    transcript = payload.get("transcript_path")
+    if not transcript:
+        print(json.dumps({"systemMessage":
+                          "chat check did not run: the hook payload carried no transcript_path"}))
+        return 0
+
+    blocks, error = _turn_text(transcript)
+    if error:
+        print(json.dumps({"systemMessage": f"chat check did not run: {error}"}))
+        return 0
+    if not blocks:
+        return 0  # a turn that said nothing to Alex, e.g. tool calls only
+
+    root = find_repo_root(Path.cwd())
+    vocab = load_vocabulary(root)
+    thin = [name for name, least in VOCAB_FLOOR.items() if len(vocab[name]) < least]
+    if thin:
+        print(json.dumps({"systemMessage":
+                          f"chat check ran without §2: the writing-standards skill loaded "
+                          f"short ({', '.join(thin)}). Run predelivery.py --selftest."}))
+        return 0
+
+    findings = []
+    for text in blocks:
+        masked = mask(text)
+        # §1.3a, not §7.8: anything addressed to Alex directly caps at two
+        # consecutive sentences. The gate had been set one notch looser than the
+        # rule it enforces since it shipped.
+        findings += [f for f in chat_findings(text, vocab)
+                     if f.severity == BLOCK]
+    if not findings:
+        return 0
+
+    lines = []
+    for finding in findings:
+        if finding.rule == "paragraph":
+            # Splitting the paragraph clears the check and manufactures §7.10's
+            # first tell — every sentence the same middling length. Name the
+            # actual fix so the gate cannot be satisfied by making the prose
+            # worse.
+            lines.append(f"- {finding.message} Restructure it as a list or a table. "
+                         f"Do NOT satisfy this by chopping it into shorter paragraphs — "
+                         f"that manufactures the uniform rhythm §7.10 bans.")
+        else:
+            lines.append(f"- {finding.message}")
+
+    print(json.dumps({
+        "decision": "block",
+        "reason": "The message you were about to send breaks rules that are already in force. "
+                  "Rewrite it and send again:\n" + "\n".join(lines),
+    }))
+    return 0
+
+
+def run_text(path_name: str) -> int:
+    """Check a block of prose that is not a deliverable file.
+
+    Used for chat replies and for pasted output handed to the audit loop
+    (master §13). Filename form, acronym glossing and the ledger gate all key
+    off a real deliverable path, so they are skipped here rather than fired
+    against a scratch file and reported as findings that mean nothing.
+
+    Prints one JSON object so a harness can read it. Exit is 1 when anything
+    blocking was found, 0 otherwise — including when the text is empty, which
+    is reported rather than passed off as clean.
+    """
+    import json
+
+    path = Path(path_name)
+    content = read_text(path)
+    if content is None:
+        print(json.dumps({"error": f"cannot read {path_name}", "findings": []}))
+        return 1
+    if not content.strip():
+        print(json.dumps({"error": "text is empty — nothing was checked", "findings": []}))
+        return 1
+
+    root = find_repo_root(path.parent.resolve()) or find_repo_root(Path.cwd())
+    vocab = load_vocabulary(root)
+    thin = [name for name, least in VOCAB_FLOOR.items() if len(vocab[name]) < least]
+    masked = mask(content)
+    findings = check_vocabulary(content, masked, vocab) + check_structure(masked)
+
+    payload = {
+        "words": len(content.split()),
+        "blocking": sum(1 for f in findings if f.severity == BLOCK),
+        "warnings": sum(1 for f in findings if f.severity != BLOCK),
+        "vocabulary_lists_short": thin,
+        "findings": [
+            {
+                "severity": "block" if f.severity == BLOCK else "warn",
+                "rule": f.rule,
+                "line": f.line,
+                "message": f.message,
+            }
+            for f in findings
+        ],
+    }
+    print(json.dumps(payload, indent=1))
+    # A short vocabulary load means §2 went partly unchecked; that is a failure
+    # of the check, not a pass, so it must not exit 0.
+    return 1 if payload["blocking"] or thin else 0
 
 
 def run_files(paths: list[str]) -> int:
@@ -887,7 +1195,110 @@ def run_selftest() -> int:
         print("predelivery selftest FAILED: the writing-standards skill did not load "
               "or its sections have moved. Vocabulary enforcement is off.", file=sys.stderr)
         return 1
-    print("predelivery selftest passed")
+
+    # A loaded list proves nothing about whether the rules fire. Each case below
+    # is text the checker must catch or must leave alone. The two marked
+    # `regression` reproduce bugs that shipped and went unnoticed.
+    def findings_for(text: str) -> list[Finding]:
+        masked = mask(text)
+        return check_vocabulary(text, masked, vocab) + check_structure(masked)
+
+    def rules_in(text: str) -> set[str]:
+        return {f.rule for f in findings_for(text)}
+
+    cases = [
+        ("banned word", "We should utilize the approach.", "banned-word", True),
+        ("banned phrase", "Great question! Here is the answer.", "banned-phrase", True),
+        ("banned opener", "The plan works. Furthermore, it is cheap.", "banned-opener", True),
+        ("litotes", "The result is not bad.", "litotes", True),
+        ("four-sentence paragraph",
+         "One sentence here. Two sentences here. Three sentences here. Four sentences here.",
+         "paragraph", True),
+        ("question heading", "## Why does this fail?\n\nBody text.", "heading", True),
+        ("closer", "The finding stands.\n\nI hope this helps.", "closer", True),
+        ("clean prose is left alone", "- A short bullet.\n- Another one.", None, False),
+        ("banned word inside a code fence is exempt",
+         "Body text here.\n\n```\nutilize this\n```\n", "banned-word", False),
+        # regression, 2026-08-13: the placeholder substitution ran on the
+        # lowercased pattern while looking for an uppercase X, so all twelve
+        # placeholder phrases were byte-identical to literals and never matched.
+        ("regression: placeholder phrase fires",
+         "It falls down when it comes to pricing.", "banned-phrase", True),
+        # regression, 2026-08-13: the quote scan read the unmasked text, so an
+        # odd number of quotes inside a fence shifted every pair after it and
+        # left banned words inside a real citation exposed to the checker.
+        ("imperative heading", "## Design for the machine path\n\nBody.", "heading", True),
+        ("imperative heading, numbered", "## 3. Close the loop\n\nBody.", "heading", True),
+        # The second token is what separates an instruction from a noun phrase
+        # that happens to start with the same word.
+        ("noun phrase starting with a verb word", "## Design decisions\n\nBody.", "heading", False),
+        ("regression: odd quote in a fence does not expose a citation",
+         '```sh\nsed \'s/"//\' f.txt\n```\n\nIt states: "The fee is a holistic two percent."\n',
+         "banned-word", False),
+    ]
+
+    # regression, 2026-08-13: three defects an expert panel reproduced, each
+    # letting a rule that was written and deployed go unenforced.
+    extra = []
+
+    # The chat gate cited §1.3a — two consecutive sentences — and ran §7.8's
+    # three, so it was one notch looser than the rule it named, since it shipped.
+    two = "This is one sentence. This is a second sentence."
+    # Through chat_findings, which is what run_stop calls — a test against
+    # check_structure directly passes whatever the gate is wired to.
+    if not [f for f in chat_findings(two + " And a third.", vocab) if f.rule == "paragraph"]:
+        extra.append("chat cap: three sentences to Alex must block at §1.3a's cap of two")
+    if [f for f in chat_findings(two, vocab) if f.rule == "paragraph"]:
+        extra.append("chat cap: two sentences is the cap, not a break")
+    if check_structure(mask(two + " And a third."), FILE_PROSE_CAP):
+        extra.append("file cap: three sentences is fine in a file under §7.8")
+    if (CHAT_PROSE_CAP, FILE_PROSE_CAP) != (2, 3):
+        extra.append("caps: §1.3a is two and §7.8 is three")
+
+    # A new break of a class the file already carried was demoted to a warning,
+    # because two four-sentence paragraphs produced identical messages.
+    old = "One. Two. Three. Four."
+    new = old + "\n\nAlpha here. Beta here. Gamma here. Delta here."
+    before = check_structure(mask(old))
+    after = check_structure(mask(new))
+    if len({f.span for f in after}) != 2:
+        extra.append("demotion: two different paragraphs must carry different spans, or the "
+                     "second demotes to a warning behind the first")
+    prior = {(f.rule, f.message, f.span) for f in before}
+    fresh = [f for f in after if (f.rule, f.message, f.span) not in prior]
+    if len(fresh) != 1:
+        extra.append("demotion: a second, different four-sentence paragraph must stay a block "
+                     "(got %d new finding(s))" % len(fresh))
+
+    # The 200-word cap is on the CLAUDE.md this system installs, and that file
+    # lives in the target repos — the only place the check did not run.
+    import tempfile
+    with tempfile.TemporaryDirectory() as tmp:
+        target = Path(tmp)
+        (target / ".claude").mkdir()
+        big = "word " * 260
+        if not check_budget(target / "CLAUDE.md", "@.claude/universal.md\n\n" + big, target):
+            extra.append("budget: the bundle's CLAUDE.md is uncapped outside the home repo")
+        if check_budget(target / "CLAUDE.md", big, target):
+            extra.append("budget: a repo's own CLAUDE.md is flagged, never blocked (§5.1)")
+
+    for line in extra:
+        print(f"  FAIL {line}")
+    if extra:
+        return 1
+
+    behaviour_ok = True
+    for name, text, rule, want in cases:
+        got = rule in rules_in(text) if rule else bool(findings_for(text))
+        if got != want:
+            behaviour_ok = False
+            print(f"  FAIL {name}: expected {rule or 'any finding'} present={want}, got {got}")
+    if not behaviour_ok:
+        print("predelivery selftest FAILED: rules loaded but did not fire as expected.",
+              file=sys.stderr)
+        return 1
+
+    print(f"predelivery selftest passed ({len(VOCAB_FLOOR)} list floors, {len(cases)} behaviours)")
     return 0
 
 
@@ -897,6 +1308,13 @@ def main() -> int:
         return run_hook()
     if args and args[0] == "--selftest":
         return run_selftest()
+    if args and args[0] == "--stop":
+        return run_stop()
+    if args and args[0] == "--text":
+        if len(args) < 2:
+            print("--text needs a file holding the prose to check", file=sys.stderr)
+            return 1
+        return run_text(args[1])
     if not args:
         print(__doc__)
         return 0

@@ -52,7 +52,7 @@ it, and say so in a line rather than omitting the heading silently.
 - **Contrast before claim.** A section explaining how something differs opens with the thing
   it differs from. The reader cannot hold "different" without the baseline.
 
-## What to fix from the sample
+## Corrections from the sample
 
 Its enumerating sections were written as continuous prose. In four of them the author had
 already typed the labels — dates in the timeline, names in the team, dated entries with

@@ -95,6 +95,7 @@ furthermore, moreover, additionally — restructure or just start the sentence. 
 - "the key takeaway is"
 - em-dash contrast tic: repeated "X — not Y — Z" interjections and "It's not X — it's Y" sentences; at most one em-dash aside per response, or per ~500 words in a document
 - hedge-opener padding: "generally speaking", "it is important to consider", "while it is true that" — commit to the claim or cut it
+- decision handed back in prose (§1.3b): "next is yours", "your call", "up to you", "let me know which", "say the word", "I'd take X first", "which do you want" — a turn ending on a decision ends on a picker, never on a sentence inviting Alex to choose
 - litotes — stating a thing by denying its opposite: "not bad", "not without merit", "no small feat", "not uncommon". Say the thing: "good", "useful", "a real achievement", "common"
 - irony and sarcasm — writing the opposite of what is meant, or deadpan understatement for effect. State the actual assessment, plainly
 
@@ -122,7 +123,7 @@ when writing one:
 
 1. Produce the asked format exactly. "Make a doc" means the repo's declared working format (its CLAUDE.md context line) unless another format is named.
 2. .docx deliverables: Helvetica throughout; tables without banding — no alternating row shading.
-3. Filenames: a name Alex states wins verbatim. When naming is left to Claude, deliverable filenames are date-prefixed in "M D YY" form, no leading zeros: `5 12 26 claude.md`, `12 3 26 brief.docx`. Repo infrastructure files (CLAUDE.md, ledger.md, memory-graph nodes, skills, installers, READMEs) are never date-prefixed — a graph node's filename is its id (master §6.4), so a date prefix would break the match.
+3. Filenames: a name Alex states wins verbatim. When naming is left to Claude, deliverable filenames are date-prefixed in "M D YY" form, no leading zeros: `5 12 26 claude.md`, `12 3 26 brief.docx`. Repo infrastructure files (CLAUDE.md, ledger.md, memory-graph files, skills, installers, READMEs) are never date-prefixed. A node has no filename of its own — it is a heading inside its domain's file (master §6.1) — so nothing here applies to one.
 4. Pre-delivery check, every deliverable, in this order (master §7.5): shape first — the form fits the content (item 7), headings are noun phrases (item 6), rhythm and weighting vary (item 9); then the §2 vocabulary sweep over the finished draft; then format and filename match the ask; scope matches the ask — one deliverable, no bonus formats; every material fact checked against the ledger (master §3); every sensitive commitment a marked quote with citation (master §4). End on the last substantive point — no summary paragraph, no sign-off, no offer of further help inside the deliverable (an adjacency offer goes in chat, after it).
 5. Minimal by default (master §7.6). Designs, PRDs, and proposals start from the smallest version that tests the idea — fewest features, screens, and states — so what to add next is a decision made on evidence, not a pruning job. Untested features in a first version are defects. Pages themselves stay plain: no decorative bold, no dense nesting, no visual noise.
 6. Headings are noun phrases (master §7.7). "Exit conditions", not "How to set exit conditions". No verbs, no questions, no sentences. This holds for slide titles. Two forms are banned outright, both of which pass as noun phrases and should not:
@@ -142,3 +143,16 @@ when writing one:
    Vary the rhythm, let length signal what matters, cut the scaffolding. Nothing mechanical checks this, so it falls to the writer on every pass.
 10. Lists hidden in sentences (master §7.8, testable form). Four or more parallel items in a comma-series is a list wearing a disguise — break it out where the items are things a reader may need to find again, compare, or count. This is the most common way a document that reads well still fails: the prose is fine sentence by sentence, and the reader cannot scan, count, or find one item again. A short series naming categories in passing is not caught by this. The one test with no judgement in it: parallel items that each begin with a repeating `Label:` — a date, a name, a category — are already a list, and only the line breaks are missing.
 11. Enumerated sections take the labelled-bullet shape (master §7.8, testable form). Any section whose job is to enumerate — risks, options, competitors, failure modes, requirements — runs one bullet per item as **name** → mechanism → consequence: what it is, why it happens, what it does to the reader's decision. Never a bare label with no mechanism, never a mechanism with no consequence. A section written this way is the standard the rest of the document is held to; if one section earns bullets, the enumerating sections beside it have not earned prose.
+
+<!-- Propagation stamps, checked by master/propagate.py (master §10.1). The §2 vocabulary blocks are checked by exact set equality instead and need no stamp. A stale hash does not mean this file is wrong; it means nobody has re-checked it since the master moved. -->
+<!-- from: master §7.1 sha:22a4bbc7 -->
+<!-- from: master §7.2 sha:b06f1779 -->
+<!-- from: master §7.3 sha:7d780b4d -->
+<!-- from: master §7.4 sha:6af9b438 -->
+<!-- from: master §7.5 sha:39c2210e -->
+<!-- from: master §7.6 sha:7f5686da -->
+<!-- from: master §7.7 sha:87d75732 -->
+<!-- from: master §7.8 sha:f195ed7b -->
+<!-- from: master §7.9 sha:d75978af -->
+<!-- from: master §7.10 sha:3ac3bdab -->
+<!-- from: master §11 sha:ec80fc83 -->

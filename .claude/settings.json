@@ -12,6 +12,59 @@
           }
         ]
       }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sh -c 'd=\"$PWD\"; while [ \"$d\" != / ] && [ ! -f \"$d/.claude/hooks/compaction.py\" ]; do d=$(dirname \"$d\"); done; f=\"$d/.claude/hooks/compaction.py\"; [ -f \"$f\" ] || f=\"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/compaction.py\"; if [ ! -f \"$f\" ] || ! command -v python3 >/dev/null 2>&1; then printf \"%s\" \"{\\\"systemMessage\\\":\\\"compaction check did not run \u2014 no .claude/hooks/compaction.py at or above $PWD, or python3 unavailable (master \u00a79.5)\\\"}\"; exit 0; fi; python3 \"$f\" --check'",
+            "timeout": 20,
+            "statusMessage": "Compaction check"
+          },
+          {
+            "type": "command",
+            "command": "sh -c 'd=\"$PWD\"; while [ \"$d\" != / ] && [ ! -f \"$d/.claude/hooks/feedback.py\" ]; do d=$(dirname \"$d\"); done; f=\"$d/.claude/hooks/feedback.py\"; [ -f \"$f\" ] || f=\"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/feedback.py\"; if [ ! -f \"$f\" ] || ! command -v python3 >/dev/null 2>&1; then printf \"%s\" \"{\\\"systemMessage\\\":\\\"feedback capture did not run \\u2014 no .claude/hooks/feedback.py at or above $PWD, or python3 unavailable. This turn was not recorded (master \\u00a79.5).\\\"}\"; exit 0; fi; python3 \"$f\" --capture; exit 0'",
+            "timeout": 20,
+            "statusMessage": "Feedback capture"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sh -c 'd=\"$PWD\"; while [ \"$d\" != / ] && [ ! -f \"$d/.claude/hooks/predelivery.py\" ]; do d=$(dirname \"$d\"); done; f=\"$d/.claude/hooks/predelivery.py\"; [ -f \"$f\" ] || f=\"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/predelivery.py\"; if [ ! -f \"$f\" ] || ! command -v python3 >/dev/null 2>&1; then printf \"%s\" \"{\\\"systemMessage\\\":\\\"chat check did not run \u2014 no .claude/hooks/predelivery.py at or above $PWD, or python3 unavailable (master \u00a79.5)\\\"}\"; exit 0; fi; python3 \"$f\" --stop'",
+            "timeout": 20,
+            "statusMessage": "Chat check"
+          }
+        ]
+      }
+    ],
+    "SessionStart": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sh -c 'd=\"$PWD\"; while [ \"$d\" != / ] && [ ! -f \"$d/.claude/sync-rules.sh\" ]; do d=$(dirname \"$d\"); done; s=\"$d/.claude/sync-rules.sh\"; [ -f \"$s\" ] || exit 0; bash \"$s\"; exit 0'",
+            "timeout": 30,
+            "statusMessage": "Kit sync"
+          }
+        ]
+      }
     ]
-  }
+  },
+  "model": "opus",
+  "effortLevel": "xhigh",
+  "enableWorkflows": true,
+  "ultracode": true,
+  "switchModelsOnFlag": false,
+  "availableModels": [
+    "opus"
+  ],
+  "enforceAvailableModels": true
 }
