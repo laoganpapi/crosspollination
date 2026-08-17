@@ -13,10 +13,14 @@
 # to track them for a cloud session to see them at all.
 set -u
 
-# Overridable so the success path can be exercised against a local checkout;
-# unset everywhere except tests, where the published copy would be the thing
-# under test rather than the thing tested against.
-RAW="${SYNC_RULES_SRC:-https://raw.githubusercontent.com/laoganpapi/Claude-Improvement/main}"
+# The source is fixed in production. It was overridable by an environment
+# variable, so anything able to set one in a session's environment chose where
+# this script fetched the code it then executes. The override survives for the
+# tests only, behind an explicit flag (audit round four).
+RAW="https://raw.githubusercontent.com/laoganpapi/Claude-Improvement/main"
+if [ "${1:-}" = "--test-source" ] && [ -n "${2:-}" ]; then
+  RAW="$2"
+fi
 CLAUDE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(dirname "$CLAUDE_DIR")"
 
@@ -31,6 +35,16 @@ MANIFEST="$(fetch install/bundle.txt)" || exit 0
 
 changed=""
 for rel in $(printf '%s\n' "$MANIFEST" | sed -e 's/#.*//' -e '/^[[:space:]]*$/d'); do
+  # Validated BEFORE it is fetched. A manifest path is a path this script
+  # writes to: anything outside `.claude/`, anything absolute, and anything
+  # climbing out with `..` is refused, and refused without downloading it.
+  case "$rel" in
+    .claude/*) ;;
+    *) echo "refusing manifest path outside .claude/: $rel" >&2; continue ;;
+  esac
+  case "$rel" in
+    *..*) echo "refusing manifest path containing ..: $rel" >&2; continue ;;
+  esac
   new="$(fetch "$rel")" || continue          # one missing file must not stop the rest
   [ -z "$new" ] && continue
   local_file="$ROOT/$rel"

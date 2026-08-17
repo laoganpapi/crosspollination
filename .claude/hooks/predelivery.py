@@ -85,7 +85,14 @@ _ABBREV = (
     r"(?<!\bvs)(?<!\betc)(?<!\bNo)(?<!\bapprox)(?<!\bFig)(?<!\bal)"
     r"(?<!\be\.g)(?<!\bi\.e)(?<!\bU\.S)(?<!\bInc)(?<!\bLtd)(?<!\bCo)"
 )
-SENTENCE_END = re.compile(_ABBREV + r"[.!?]+[\"')\]]*(?:\s+|$)(?=[A-Z\"'(\[]|$)")
+# The next sentence may open lower-case. Requiring a capital collapsed a whole
+# paragraph to one sentence whenever it did — `one here. two follow. three is
+# plenty. four is too many.` counted as one and the cap never fired (audit
+# round three). A digit or a bullet marker opens one too. What must NOT open one
+# is a lower-case continuation of an abbreviation, which _ABBREV already
+# handles.
+SENTENCE_END = re.compile(
+    _ABBREV + r"[.!?]+[\"')\]]*(?:\s+|$)(?=[A-Za-z0-9\"'(\[\-*]|$)")
 
 DATE_PREFIX = re.compile(r"^(?:[1-9]|1[0-2]) (?:[1-9]|[12]\d|3[01]) \d{2} \S")
 BAD_DATE_PREFIX = re.compile(r"^(\d{1,2})[_\-.](\d{1,2})[_\-.](\d{2,4})[_\-.]")
@@ -253,13 +260,19 @@ def load_vocabulary(root: Path | None) -> dict:
         return ""
 
     def comma_words(body: str) -> list[str]:
+        # Every line of the block, not the first one. Returning on the first
+        # meant a term added on a continuation line was loaded by nothing and
+        # every check stayed green — the ban existed in the rules and was
+        # enforced nowhere (audit round four). propagate.vocab_terms already
+        # reads the whole block, so the two now agree.
+        found: list[str] = []
         for line in body.splitlines():
             line = line.strip()
             if not line or line.startswith(("-", "*", "#")):
                 continue
             head = line.split(" — ")[0]
-            return [w.strip().lower() for w in head.split(",") if w.strip()]
-        return []
+            found += [w.strip().lower() for w in head.split(",") if w.strip()]
+        return found
 
     def bullet_terms(body: str) -> dict[str, str]:
         out: dict[str, str] = {}
@@ -333,13 +346,17 @@ def mask(text: str) -> str:
         blank(front.start(), front.end())
 
     # Spans that legitimately cross lines. DOTALL belongs to these only.
-    for pattern in (
-        r"```.*?```",           # fenced code
-        r"~~~.*?~~~",
-        r"<!--.*?-->",          # html comments
-    ):
-        for m in re.finditer(pattern, text, re.DOTALL):
-            blank(m.start(), m.end())
+    #
+    # A fence opens at the start of a line and closes at the start of a line.
+    # Matching ``` anywhere paired an inline ``` in prose with the next real
+    # fence and blanked everything between — real prose exempted from every
+    # check, and the code that should have been exempt exposed instead. An
+    # unclosed fence now runs to the end rather than swallowing a later pair
+    # (audit round two).
+    for m in re.finditer(r"^(```|~~~).*?(?:^\1|\Z)", text, re.DOTALL | re.MULTILINE):
+        blank(m.start(), m.end())
+    for m in re.finditer(r"<!--.*?-->", text, re.DOTALL):
+        blank(m.start(), m.end())
 
     # Line-bound spans. DOTALL must never reach these: it lets `.` match a
     # newline, so a greedy `.*$` runs from the first match to the end of the
@@ -371,11 +388,35 @@ def mask(text: str) -> str:
     # quote in the prose and blank everything between them. That bug turned a
     # legitimate §4 citation into an unquoted commitment. Two sessions found and
     # fixed this independently on 2026-08-13, with the same fix.
+    # Walk openers and closers rather than zipping positions. Pairing the 1st
+    # with the 2nd, the 3rd with the 4th and so on means ONE unpaired quote
+    # shifts every pair after it, and the mask inverts: prose gets blanked and
+    # quoted material gets scanned. Measured — `The gap is 5" wide. This
+    # holistic approach delves into utilize territory per "the memo".` produced
+    # zero findings, the same line without the inch-mark produced three, and the
+    # reverse case scanned words inside a §4 citation that §2 exempts.
+    #
+    # A quote preceded by a word character and followed by one cannot be either
+    # end of a quotation — that is an inch-mark, an apostrophe-s, a code
+    # artefact — so it is skipped rather than allowed to shift the pairing.
     partial = "".join(out)
-    straight = [m.start() for m in re.finditer(r"\"", partial)]
-    for start, end in zip(straight[0::2], straight[1::2]):
-        if "\n\n" not in partial[start:end]:
-            blank(start, end + 1)
+    open_straight = None
+    for m in re.finditer(r"\"", partial):
+        before = partial[m.start() - 1] if m.start() else " "
+        after = partial[m.end()] if m.end() < len(partial) else " "
+        if open_straight is None:
+            if after.isspace() or after in ")]}.,;:!?":
+                continue          # cannot open a quotation
+            open_straight = m.start()
+        else:
+            if before.isspace() or before == "\n":
+                continue          # cannot close one
+            if "\n\n" not in partial[open_straight:m.end()]:
+                # m.end() already sits past the closing quote. The extra +1 ate
+                # the sentence terminator after it, so `He said "yes". Then he
+                # left.` counted as one sentence (audit round two).
+                blank(open_straight, m.end())
+            open_straight = None
     open_at = None
     for m in re.finditer(r"[“”]", partial):
         if m.group(0) == "“" and open_at is None:
@@ -426,11 +467,36 @@ def prose_blocks(masked: str) -> list[tuple[int, str, bool]]:
     return blocks
 
 
+# A token ending in a period that is an abbreviation rather than a sentence end:
+# an initial (`J.`), a dotted form (`p.m.`, `U.K.`, `e.g.`), or a short word
+# followed by a lower-case continuation. Checked on the token rather than kept
+# in a list, because the list can never be complete — allowing a lower-case or
+# digit start (needed, or a whole lower-case paragraph counted as one sentence)
+# made every unlisted abbreviation read as a sentence end, and the gate then
+# blocked messages that were inside the cap (audit round four).
+# Initials (`J.`) and dotted forms (`p.m.`, `U.K.`, `e.g.`) only. A general
+# "short word" rule swallowed real sentence ends — `one here. two follow.`
+# counted as two because `here.` is five letters.
+ABBREV_SHAPE = re.compile(r"(?:^|\s)(?:[A-Za-z]\.|(?:[A-Za-z]\.){2,})$")
+
+
 def count_sentences(paragraph: str) -> int:
     text = paragraph.strip()
     if not text:
         return 0
-    return max(1, len(SENTENCE_END.findall(text)))
+    real = 0
+    for m in SENTENCE_END.finditer(text):
+        before = text[:m.start() + 1]
+        after = text[m.end():m.end() + 1]
+        # A capital after the break settles it: an abbreviation can precede a
+        # real sentence end too ("...at 3 p.m. We left.").
+        if after and (after.isupper() or after in "\"'([") or not after:
+            real += 1
+            continue
+        if ABBREV_SHAPE.search(before):
+            continue        # `p.m. today`, `vs. 4`, `Fig. 2` — one sentence
+        real += 1
+    return max(1, real)
 
 
 # --------------------------------------------------------------------------
@@ -1181,6 +1247,44 @@ def run_files(paths: list[str]) -> int:
     return worst
 
 
+def _drive_stop(payload) -> str:
+    """Run the Stop gate the way the harness does: JSON on stdin."""
+    import io
+    import json as _json
+    from contextlib import redirect_stdout
+    saved = sys.stdin
+    sys.stdin = io.StringIO(_json.dumps(payload))
+    buffer = io.StringIO()
+    try:
+        with redirect_stdout(buffer):
+            run_stop()
+    except SystemExit:
+        pass
+    finally:
+        sys.stdin = saved
+    return buffer.getvalue()
+
+
+def _drive_hook(payload) -> str:
+    """Run the PostToolUse gate exactly as the harness does: JSON on stdin.
+
+    Calling check() in a test cannot tell a working gate from one whose payload
+    parsing returns None — the suite stayed green with the gate stubbed out.
+    """
+    import io
+    import json as _json
+    from contextlib import redirect_stdout
+    saved = sys.stdin
+    sys.stdin = io.StringIO(_json.dumps(payload))
+    buffer = io.StringIO()
+    try:
+        with redirect_stdout(buffer):
+            run_hook()
+    finally:
+        sys.stdin = saved
+    return buffer.getvalue()
+
+
 def run_selftest() -> int:
     """Confirm the rules actually loaded. A silent empty load checks nothing."""
     vocab = load_vocabulary(find_repo_root(Path(__file__).resolve().parent))
@@ -1282,6 +1386,122 @@ def run_selftest() -> int:
         if check_budget(target / "CLAUDE.md", big, target):
             extra.append("budget: a repo's own CLAUDE.md is flagged, never blocked (§5.1)")
 
+    # A term on a continuation line must be loaded. Returning on the first line
+    # of a block meant such a term was in the rules and enforced by nothing.
+    two_lines = "alpha, beta\ngamma, delta — with a note\n"
+    got = comma_words(two_lines) if "comma_words" in dir() else None
+    if got is not None and "gamma" not in got:
+        extra.append("vocabulary: a term on a continuation line is not loaded")
+
+    # The quote mask, both directions. One unpaired straight quote used to shift
+    # every pair after it: `The gap is 5" wide...` hid three banned words, and
+    # the reverse scanned words inside a §4 citation that §2 exempts. Driven
+    # through chat_findings, the function the Stop gate actually calls.
+    mask_cases = [
+        ('an inch-mark must not hide banned prose',
+         'The gap is 5" wide. This holistic approach delves into utilize territory per "x".',
+         True),
+        ('the same prose without it still fires',
+         'The gap is 5 inches wide. This holistic approach delves into utilize territory.',
+         True),
+        ('banned words inside a quotation stay exempt',
+         'He wrote: "this holistic approach will delve into how we utilize it".', False),
+        ('clean prose is left alone',
+         'The gap is five inches wide and the memo says so.', False),
+    ]
+    mask_cases += [
+        # One stray inline fence plus a real block below it: greedy pairing
+        # matched the stray with the block's OPENING fence and blanked the
+        # prose between them, exempting it from every check.
+        ('a stray inline fence must not pair with a later real one',
+         'Write ``` inline here.\n\nThis holistic approach delves into utilize land.\n\n'
+         '```\ncode\n```\n', True),
+        ('a real fenced block stays exempt',
+         '```\nholistic delve utilize\n```\n', False),
+        ('prose after a real fenced block is still checked',
+         '```\ncode\n```\n\nThis holistic approach delves into utilize land.', True),
+    ]
+    for name, text, want in mask_cases:
+        if bool([f for f in chat_findings(text, vocab) if "§2" in f.message]) != want:
+            extra.append("quote mask: %s" % name)
+
+    # A closing quote used to blank one character past itself, eating the
+    # sentence terminator, so two sentences counted as one and the §1.3a cap
+    # ran loose after any quotation.
+    # A sentence may open lower-case; requiring a capital collapsed a whole
+    # paragraph to one and the cap never fired on it.
+    # Counted exactly, both ways: requiring a capital under-counted a lower-case
+    # paragraph to one; allowing anything made every unlisted abbreviation a
+    # sentence end and blocked messages already inside the cap.
+    for sample, want in [
+            ("We met Dr. Smith at 3 p.m. today. We left.", 2),
+            ("The U.K. team signed. That is done.", 2),
+            ("one here. two follow now. three is plenty. four is too many.", 4),
+            ("One here. Two follow. Three is plenty.", 3),
+            ("The rate is 3.5 percent this year.", 1),
+            ("The run costs 3 vs. 4 units and that is all.", 1)]:
+        got = count_sentences(sample)
+        if got != want:
+            extra.append("sentence count: %r counted %d, wanted %d" % (sample[:40], got, want))
+
+    for label, sample, want in [
+            ("lower-case sentence starts still count",
+             "one here. two follow now. three is plenty. four is too many.", True),
+            ("an abbreviation does not end a sentence",
+             "We met Dr. Smith at 3 p.m. today.", False),
+            ("a decimal does not end one either",
+             "The rate is 3.5 percent this year.", False)]:
+        if bool([f for f in chat_findings(sample, vocab) if "1.3a" in f.message]) != want:
+            extra.append("sentence count: %s" % label)
+
+    quoted = 'He said "yes". Then he left. Then he came back.'
+    counted = [f for f in chat_findings(quoted, vocab) if "1.3a" in f.message]
+    if not counted or "has 3" not in counted[0].message:
+        extra.append("sentence count: a quotation must not swallow the terminator after it "
+                     "(got %r)" % (counted[0].message if counted else "no finding"))
+
+    # The gate itself, end to end, on the payload shape the harness sends. The
+    # suite could not tell a working write-gate from one returning nothing:
+    # stubbing check() to [] left it green while the hook shipped dead to 11
+    # repos (audit, 2026-08-17).
+    with tempfile.TemporaryDirectory() as tmp:
+        doc = Path(tmp) / "note.md"
+        payload = {"tool_name": "Write", "tool_input": {
+            "file_path": str(doc),
+            "content": "# Note\n\nThis holistic approach will delve into how we utilize it.\n"}}
+        spoken = _drive_hook(payload)
+        if "deny" not in spoken:
+            extra.append("write gate: a Write carrying banned vocabulary was not denied "
+                         "(got %r)" % spoken[:120])
+        clean = {"tool_name": "Write", "tool_input": {
+            "file_path": str(doc), "content": "# Note\n\nThe gap is five inches wide.\n"}}
+        if "deny" in _drive_hook(clean):
+            extra.append("write gate: clean prose was denied")
+
+    # The Stop gate, end to end. run_stop() and _turn_text() had no test at
+    # all: the chat check could be stubbed to nothing and the suite stayed
+    # green while every message shipped unchecked (audit round three).
+    with tempfile.TemporaryDirectory() as tmp:
+        log = Path(tmp) / "transcript.jsonl"
+        import json as _j
+        bad = ("One sentence here. A second sentence follows. And a third one lands. "
+               "A fourth for good measure.")
+        log.write_text(
+            _j.dumps({"type": "user", "message": {"content": "hello"}}) + "\n" +
+            _j.dumps({"type": "assistant",
+                      "message": {"content": [{"type": "text", "text": bad}]}}) + "\n",
+            encoding="utf-8")
+        spoken = _drive_stop({"transcript_path": str(log)})
+        if "1.3a" not in spoken:
+            extra.append("chat gate: a four-sentence paragraph was not blocked (got %r)"
+                         % spoken[:140])
+        log.write_text(
+            _j.dumps({"type": "assistant", "message": {"content": [
+                {"type": "text", "text": "- one\n- two\n- three"}]}}) + "\n",
+            encoding="utf-8")
+        if "1.3a" in _drive_stop({"transcript_path": str(log)}):
+            extra.append("chat gate: a clean list was blocked")
+
     for line in extra:
         print(f"  FAIL {line}")
     if extra:
@@ -1333,4 +1553,8 @@ if __name__ == "__main__":
                               f"for this write (master §9.5)"}))
             sys.exit(0)
         print(f"predelivery: internal error: {exc}", file=sys.stderr)
-        sys.exit(0)
+        # A crash in --selftest must fail. Failing open belongs to the hook,
+        # where blocking a write on our own bug costs more than the check is
+        # worth; a test run that crashes and exits 0 makes its CI step
+        # incapable of failing (audit round three).
+        sys.exit(1 if "--selftest" in sys.argv else 0)

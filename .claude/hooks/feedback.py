@@ -30,6 +30,8 @@ own bug would cost more than the feedback it protects. When it cannot write, it
 says so in a systemMessage rather than passing silently.
 """
 
+import contextlib
+import fcntl
 import hashlib
 import json
 import os
@@ -82,7 +84,12 @@ def repo_root(start):
         return Path(found.stdout.strip())
     here = Path(start).resolve()
     for candidate in [here, *here.parents]:
-        if (candidate / ".claude").is_dir():
+        # `memory/map.md` too, and checked at the same level: outside git this
+        # walked past a repo carrying the graph and stopped at the first
+        # ancestor with any `.claude` directory — including a stray one in a
+        # temp root — so captures landed outside the repo entirely (audit round
+        # three).
+        if (candidate / "memory" / "map.md").is_file() or (candidate / ".claude").is_dir():
             return candidate
     return here
 
@@ -94,9 +101,18 @@ def inbox(root):
 
 
 def origin(root):
+    """The remote, with any embedded credential removed.
+
+    This goes verbatim into a record that is committed and later harvested. A
+    remote of the form `https://user:token@github.com/...` — which the deploy
+    and harvest paths themselves once used — would have written the token into
+    a file in the repo (audit round three).
+    """
     found = subprocess.run(["git", "-C", str(root), "remote", "get-url", "origin"],
                            capture_output=True, text=True)
-    return found.stdout.strip() if found.returncode == 0 else "(no remote)"
+    if found.returncode != 0:
+        return "(no remote)"
+    return re.sub(r"(https?://)[^/@\s]*@", r"\1", found.stdout.strip())
 
 
 def branch(root):
@@ -109,14 +125,56 @@ def normalise(text):
     return " ".join(re.sub(r"[^\w\s]", "", text.lower()).split())
 
 
-def record_id(text, day):
-    """Per occurrence per day, not per text.
+def record_id(text, day, where=""):
+    """Per occurrence per day per repo, not per text.
 
     Keying on the text alone and skipping a repeat would collapse the one signal
     the graph is built on: a correction Alex has to give twice is worse than one
     he gives once, and the count is the evidence.
+
+    The repo is in the key because the harvest merges records from every repo by
+    id. Without it, the same words on the same day in two repos collapsed to one
+    record and the losing repo's origin, count and context were discarded — and
+    "stop doing that" on one day across two repos is exactly the case the count
+    exists to measure (audit, 2026-08-17).
     """
-    return "fb-%s-%s" % (day, hashlib.sha1(normalise(text).encode("utf-8")).hexdigest()[:10])
+    # The RAW text in the key, not just the normalised form. Normalising strips
+    # punctuation, so "stop." and "stop!" hashed the same and the second
+    # prompt's exact words were never stored (audit round three).
+    seed = normalise(text) + "\x00" + text + "\x00" + (where or "")
+    # surrogatepass, so an id can always be computed. An unpaired surrogate
+    # raised here — before the writer's own tolerant encoder saw anything — and
+    # the turn was dropped entirely (audit round four).
+    return "fb-%s-%s" % (day, hashlib.sha1(
+        seed.encode("utf-8", "surrogatepass")).hexdigest()[:10])
+
+
+SECRETS = [
+    (re.compile(r"\bgh[pusor]_[A-Za-z0-9]{20,}"), "[redacted: github token]"),
+    (re.compile(r"\bgithub_pat_[A-Za-z0-9_]{20,}"), "[redacted: github token]"),
+    (re.compile(r"\bsk-[A-Za-z0-9\-_]{20,}"), "[redacted: api key]"),
+    (re.compile(r"\bxox[baprs]-[A-Za-z0-9-]{10,}"), "[redacted: slack token]"),
+    (re.compile(r"\bAKIA[0-9A-Z]{16}\b"), "[redacted: aws key id]"),
+    (re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----"),
+     "[redacted: private key]"),
+    (re.compile(r"(https?://)[^/\s:]+:[^/\s@]+@"), r"\1[redacted]@"),
+    (re.compile(r"\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}"),
+     "[redacted: token]"),
+]
+
+
+def redact(text):
+    """Take recognisable credentials out before anything is stored.
+
+    A capture is committed to the repo it was typed in and then copied here by
+    the harvest, so a token pasted into a prompt would be replicated and kept
+    (audit round four). Shape-based and therefore incomplete by construction —
+    it catches the common issuers, not everything — but a redaction that misses
+    some is strictly better than storing all of them.
+    """
+    for pattern, replacement in SECRETS:
+        text = pattern.sub(replacement, text)
+    return text
 
 
 def signals_in(text):
@@ -180,43 +238,51 @@ def capture(payload, root=None, today=None):
     root = root or repo_root(payload.get("cwd") or os.getcwd())
     day = today or __import__("datetime").date.today().isoformat()
     folder, _home = inbox(root)
-    ident = record_id(text, day)
     try:
         folder.mkdir(parents=True, exist_ok=True)
         target = folder / ("%s.md" % day)
-        existing = target.read_text(encoding="utf-8") if target.exists() else ""
         found = signals_in(text)
-        if ("## %s" % ident) in existing:
-            # Same words, same day: a repeat inside one session. Count it rather
-            # than dropping it — recurrence is the measurement.
-            updated = bump_seen(existing, ident)
-            write_atomic(target, updated)
-            return target, ident, found
-        block = [
-            "## %s" % ident,
-            "%s · %s · %s" % (origin(root), branch(root), day),
-            "signals: %s" % (", ".join(found) if found else "none"),
-            "seen: 1",
-            "status: new",
-            "",
-            "> " + "\n> ".join(text.splitlines()),
-            "",
-        ]
         about = last_assistant(payload.get("transcript_path"))
-        if about:
-            block[-1:] = ["about: %s" % about, ""]
-        header = "" if existing else ("# Feedback captured %s\n\nVerbatim, unclassified, "
-                                      "append-only. Promotion to a graph node is a session's "
-                                      "job; forgetting is not available.\n\n" % day)
-        write_atomic(target, existing + header + "\n".join(block) + "\n")
+        # Everything slow happens before the lock: two git calls and a
+        # transcript read used to sit between the read and the write, and
+        # twelve concurrent captures against a fresh repo left four records on
+        # disk, all twelve exiting 0 in silence (audit, 2026-08-17).
+        where = "%s · %s · %s" % (origin(root), branch(root), day)
+        ident = record_id(text, day, origin(root))
+        with locked(folder / (".%s.lock" % day)):
+            existing = target.read_text(encoding="utf-8") if target.exists() else ""
+            if ("## %s" % ident) in existing:
+                # Same words, same day: a repeat inside one session. Count it
+                # rather than dropping it — recurrence is the measurement.
+                write_atomic(target, bump_seen(existing, ident))
+                return target, ident, found
+            block = [
+                "## %s" % ident,
+                where,
+                "signals: %s" % (", ".join(found) if found else "none"),
+                "seen: 1",
+                "status: new",
+                "",
+                "> " + "\n> ".join(lines_of(redact(text))),
+                "",
+            ]
+            if about:
+                block[-1:] = ["about: %s" % redact(about), ""]
+            header = "" if existing else ("# Feedback captured %s\n\nVerbatim, unclassified, "
+                                          "append-only. Promotion to a graph node is a session's "
+                                          "job; forgetting is not available.\n\n" % day)
+            write_atomic(target, existing + header + "\n".join(block) + "\n")
         return target, ident, found
-    except OSError as exc:
+    except Exception as exc:
+        # Not just OSError. An unpaired surrogate in the prompt raised
+        # UnicodeEncodeError straight past this handler, losing the turn and
+        # leaving a temp file behind.
         return None, "cannot write to %s (%s)" % (folder, exc), []
 
 
 def bump_seen(text, ident):
     out, inside = [], False
-    for line in text.splitlines():
+    for line in lines_of(text):
         if line.startswith("## "):
             inside = line[3:].strip() == ident
         if inside and line.startswith("seen: "):
@@ -228,13 +294,62 @@ def bump_seen(text, ident):
     return "\n".join(out) + "\n"
 
 
+@contextlib.contextmanager
+def locked(path):
+    """Hold a lock across a read-modify-write of the day file.
+
+    Capture reads the file, decides whether the record is already there, and
+    writes the whole thing back. Without this, two prompts arriving together
+    both read the same text and the second write erases the first — measured at
+    four records surviving out of twelve, with every run exiting 0 in silence.
+
+    Failure behaviour: if locking is unavailable the capture still happens. A
+    hook that refuses to record because it could not take a lock loses exactly
+    what it exists to protect.
+    """
+    handle = None
+    try:
+        handle = open(path, "w")
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+    except Exception:
+        handle = None
+    try:
+        yield
+    finally:
+        if handle is not None:
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            finally:
+                handle.close()
+
+
+def lines_of(text):
+    """Split on newlines only.
+
+    `splitlines()` also breaks on U+0085, U+2028, U+2029, form feed and
+    vertical tab, and swallows them — five characters silently deleted from a
+    quote §4 requires character for character.
+    """
+    return text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+
+
 def write_atomic(path, text):
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    with open(tmp, "w", encoding="utf-8") as handle:
-        handle.write(text)
-        handle.flush()
-        os.fsync(handle.fileno())
-    os.replace(tmp, path)
+    # A unique temp name: one fixed `<day>.md.tmp` was shared by every writer,
+    # so two captures racing could each half-write the other's file.
+    tmp = path.with_suffix(path.suffix + ".tmp.%d" % os.getpid())
+    try:
+        with open(tmp, "w", encoding="utf-8", errors="backslashreplace") as handle:
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, path)
+    except Exception:
+        # Never leave a stray temp file behind for the next reader to find.
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 
 def blocks(text):
@@ -244,7 +359,7 @@ def blocks(text):
     use. Reading line by line and carrying state across headings is how a field
     belonging to one record gets attributed to the one before it.
     """
-    lines = text.splitlines()
+    lines = lines_of(text)
     starts = [i for i, line in enumerate(lines) if RECORD_HEAD.match(line)]
     for index, start in enumerate(starts):
         end = starts[index + 1] if index + 1 < len(starts) else len(lines)
@@ -306,6 +421,14 @@ def mark(path, ident, node_id):
     after and the write is abandoned if it differs — the field this file exists
     to protect is the one a rewrite would damage.
     """
+    # The same read-modify-write the capture path takes a lock for, on the same
+    # file. A promotion running while a prompt is captured would otherwise erase
+    # whichever landed first.
+    with locked(path.parent / (".%s.lock" % path.stem)):
+        return _mark_locked(path, ident, node_id)
+
+
+def _mark_locked(path, ident, node_id):
     text = path.read_text(encoding="utf-8")
     out, hit, before, after = [], False, None, None
     for found, _start, body in blocks(text):
@@ -328,7 +451,7 @@ def mark(path, ident, node_id):
     if not hit:
         return False, "%s: no such record" % ident
 
-    lines = text.splitlines()
+    lines = lines_of(text)
     for found, start, body in blocks(text):
         if found == ident:
             lines[start:start + len(body)] = out
@@ -529,6 +652,109 @@ def run_selftest():
         check("marking an unknown record is refused and named",
               not done and "no such record" in problem, repr(problem))
 
+        # Concurrency. Twelve prompts arriving together left ONE record on disk
+        # with the read-modify-write unlocked, and all twelve exited 0 saying
+        # nothing. This is the test the shipped code failed (audit, 2026-08-17).
+        import concurrent.futures
+        busy = Path(tmp) / "busy"
+        (busy / "memory").mkdir(parents=True)
+        (busy / "memory" / "map.md").write_text("# map\n", encoding="utf-8")
+        with concurrent.futures.ThreadPoolExecutor(max_workers=12) as pool:
+            done = list(pool.map(
+                lambda i: capture({"prompt": "concurrent prompt %d" % i}, busy, "2026-08-13"),
+                range(12)))
+        check("every concurrent capture reports success",
+              all(p is not None for p, _i, _s in done))
+        stored = (busy / "memory" / "inbox" / "2026-08-13.md").read_text(encoding="utf-8")
+        check("no concurrent capture is lost",
+              len(re.findall(r"^## fb-", stored, re.M)) == 12,
+              "%d of 12" % len(re.findall(r"^## fb-", stored, re.M)))
+        check("no temp file is left behind",
+              not list((busy / "memory" / "inbox").glob("*.tmp*")))
+
+        # Line endings the quote must survive. splitlines() ate five characters
+        # §4 requires reproduced exactly.
+        odd = "one twothreefourfive\r\nsix"
+        check("only newlines split a quote", len(lines_of(odd)) == 2, repr(lines_of(odd)))
+        check("the exotic separators survive verbatim",
+              " " in lines_of(odd)[0] and "" in lines_of(odd)[0],
+              repr(lines_of(odd)[0]))
+        path, ident, _s = capture({"prompt": odd}, root, "2026-08-15")
+        check("a captured quote keeps them",
+              " " in path.read_text(encoding="utf-8"), "lost in the stored record")
+
+        # Every REWRITE path too, not just the write. Fixing capture alone left
+        # bump_seen, blocks() and mark() normalising the stored quote, so a
+        # character survived being written and died the next time anything
+        # touched the file (audit round two).
+        exotic = "keep\u2028these\u0085apart\x0bplease"
+        path, ident, _s = capture({"prompt": exotic}, root, "2026-08-19")
+        stored = path.read_text(encoding="utf-8")
+        capture({"prompt": exotic}, root, "2026-08-19")          # a repeat: bump_seen rewrites
+        after_bump = path.read_text(encoding="utf-8")
+        check("a repeat does not normalise the stored quote",
+              "\u2028" in after_bump and "\u0085" in after_bump and "\x0b" in after_bump,
+              repr([c for c in "\u2028\u0085\x0b" if c not in after_bump]))
+        mark(path, ident, "CI-500")                               # promotion rewrites too
+        after_mark = path.read_text(encoding="utf-8")
+        check("a promotion does not normalise the stored quote",
+              "\u2028" in after_mark and "\u0085" in after_mark and "\x0b" in after_mark,
+              repr([c for c in "\u2028\u0085\x0b" if c not in after_mark]))
+        check("the promotion still landed",
+              "node: CI-500" in after_mark)
+
+        # A credential pasted into a prompt is committed here and copied to the
+        # home repo by the harvest. Shape-based and incomplete by construction;
+        # catching the common issuers beats storing all of them.
+        for secret, label in [
+                ("ghp_abcdefghijklmnopqrstuvwxyz012345", "github token"),
+                ("github_pat_11ABCDEFG0abcdefghijklmno", "github token"),
+                ("sk-ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789", "api key"),
+                ("xoxb-1234567890-abcdefghijkl", "slack token"),
+                ("AKIAIOSFODNN7EXAMPLE", "aws key id")]:
+            cleaned = redact("here it is: %s ok" % secret)
+            check("a %s is redacted" % label, secret not in cleaned, cleaned)
+        check("an inline credential in a url is redacted",
+              "sekrit" not in redact("clone https://u:sekrit@github.com/a/b.git"))
+        check("ordinary words survive redaction",
+              redact("nothing secret at all here") == "nothing secret at all here")
+        stored = capture({"prompt": "token ghp_abcdefghijklmnopqrstuvwxyz012345 here"},
+                         root, "2026-08-21")[0].read_text(encoding="utf-8")
+        check("a captured prompt is stored redacted",
+              "ghp_abcdefghijklmnopqrstuvwxyz012345" not in stored)
+
+        # An unpaired surrogate raised in record_id, before the writer's own
+        # tolerant encoder saw anything, and the whole turn was dropped.
+        lone = "bad \udcff text"
+        check("an unpaired surrogate still gets an id",
+              record_id(lone, "2026-08-13", "r").startswith("fb-2026-08-13-"))
+        path, ident, _s = capture({"prompt": lone}, root, "2026-08-22")
+        check("and the turn is still recorded", path is not None and path.exists(), repr(ident))
+
+        # A credential in the remote must never reach a committed record.
+        check("a token in the remote is stripped",
+              "@" not in re.sub(r"(https?://)[^/@\s]*@", r"\1",
+                                "https://x-access-token:sekrit@github.com/a/b.git"))
+        # Two prompts differing only in punctuation are two records: normalise()
+        # strips it, so they hashed the same and the second was never stored.
+        check("punctuation alone still makes a new record",
+              record_id("stop.", "2026-08-13", "r") != record_id("stop!", "2026-08-13", "r"))
+        check("identical text is still one record",
+              record_id("stop.", "2026-08-13", "r") == record_id("stop.", "2026-08-13", "r"))
+
+        # The same words on the same day in two repos are two records. The
+        # harvest merges by id, so a shared id discarded the losing repo's
+        # origin, its count and its context.
+        left = record_id("stop doing that", "2026-08-13", "https://github.com/a/one")
+        right = record_id("stop doing that", "2026-08-13", "https://github.com/a/two")
+        check("two repos do not collapse to one record", left != right, "%s == %s" % (left, right))
+        check("the same repo and words still collapse, so a repeat is counted",
+              left == record_id("stop doing that", "2026-08-13", "https://github.com/a/one"))
+        check("a different day is still a different record",
+              left != record_id("stop doing that", "2026-08-14", "https://github.com/a/one"))
+        check("the id keeps its shape",
+              re.fullmatch(r"fb-\d{4}-\d{2}-\d{2}-[0-9a-f]{10}", left) is not None, left)
+
         # A field belongs to the record it sits under, never the one before it.
         two = ("## fb-2026-08-13-aaaaaaaaaa\nsignals: none\nseen: 1\nstatus: new\n\n> first\n\n"
                "## fb-2026-08-13-bbbbbbbbbb\nsignals: correction\nseen: 4\nstatus: written up\n"
@@ -541,6 +767,32 @@ def run_selftest():
               repr(split["fb-2026-08-13-aaaaaaaaaa"]))
         check("a promoted record reads back its node",
               split["fb-2026-08-13-bbbbbbbbbb"]["node"] == "CI-002")
+
+    # The hook boundary. Everything above tests capture() directly; the harness
+    # sends JSON on stdin and run_capture() reads the `prompt` key from it. A
+    # wrong key there records nothing, forever, in every repo, and no test
+    # below that boundary can tell (audit round three).
+    import io
+    import json as _j
+    from contextlib import redirect_stdout
+    with tempfile.TemporaryDirectory() as tmp:
+        home = Path(tmp)
+        (home / "memory").mkdir()
+        (home / "memory" / "map.md").write_text("# map\n", encoding="utf-8")
+        saved_in, saved_cwd = sys.stdin, os.getcwd()
+        os.chdir(home)
+        try:
+            sys.stdin = io.StringIO(_j.dumps({"prompt": "through the real boundary",
+                                              "cwd": str(home)}))
+            with redirect_stdout(io.StringIO()):
+                run_capture()
+        finally:
+            sys.stdin, _ = saved_in, os.chdir(saved_cwd)
+        landed = list((home / "memory" / "inbox").glob("*.md"))
+        ran += 1
+        if not landed or "through the real boundary" not in landed[0].read_text(encoding="utf-8"):
+            failures.append("the capture hook records nothing when driven the way the "
+                            "harness drives it (JSON on stdin)")
 
     for line in failures:
         print("FAIL " + line)

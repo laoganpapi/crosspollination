@@ -1,0 +1,8 @@
+.claude/universal.md
+.claude/sync-rules.sh
+.claude/hooks/predelivery.py
+.claude/hooks/compaction.py
+.claude/hooks/feedback.py
+.claude/skills/writing-standards/SKILL.md
+.claude/skills/writing-standards/references/memo-form.md
+.claude/skills/prd/SKILL.md

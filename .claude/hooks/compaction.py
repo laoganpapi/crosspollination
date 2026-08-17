@@ -32,6 +32,7 @@ notice is a worse outcome than a duplicate one, so on any doubt it speaks.
 """
 
 import json
+import pathlib
 import os
 import sys
 from pathlib import Path
@@ -131,21 +132,23 @@ def run_check() -> int:
     if seen == uuid:
         return 0  # already announced
 
+    reply = {"hookSpecificOutput": {
+        "hookEventName": "UserPromptSubmit",
+        "additionalContext": notice(metadata, timestamp),
+    }}
     try:
         path.write_text(json.dumps({"uuid": uuid}), encoding="utf-8")
     except OSError:
         # Losing the marker means the notice repeats next turn. Repeating is the
         # safe direction, so this is reported and not treated as a failure.
-        print(json.dumps({"systemMessage":
-                          "compaction notice sent, but its marker could not be saved; "
-                          "it may repeat next turn"}))
-
-    print(json.dumps({
-        "hookSpecificOutput": {
-            "hookEventName": "UserPromptSubmit",
-            "additionalContext": notice(metadata, timestamp),
-        }
-    }))
+        #
+        # In ONE document. Printing a second alongside the notice meant the
+        # hook emitted two JSON documents on stdout, where a single one is
+        # expected — most likely discarding the notice in exactly the branch
+        # this code says it handles (audit round three).
+        reply["systemMessage"] = ("compaction notice sent, but its marker could not be "
+                                  "saved; it may repeat next turn")
+    print(json.dumps(reply))
     return 0
 
 
@@ -211,9 +214,61 @@ def run_selftest() -> int:
     check("notice gives the size", "824,052" in text, True)
     check("notice says it is not a stop signal", "not a reason to stop" in text, True)
 
+    # run_check itself — the whole hook — had no test. Everything above tests
+    # its helpers, so the notice and its dedup could both be broken with the
+    # suite green (audit round three).
+    import io
+    import os
+    import tempfile
+    from contextlib import redirect_stdout
+
+    def drive(payload):
+        saved = sys.stdin
+        sys.stdin = io.StringIO(json.dumps(payload))
+        buffer = io.StringIO()
+        try:
+            with redirect_stdout(buffer):
+                run_check()
+        finally:
+            sys.stdin = saved
+        return buffer.getvalue()
+
+    checks = 11
+    with tempfile.TemporaryDirectory() as tmp:
+        log = pathlib.Path(tmp) / "t.jsonl"
+        log.write_text(json.dumps(boundary) + "\n", encoding="utf-8")
+        held = os.environ.get("TMPDIR")
+        os.environ["TMPDIR"] = tmp     # state_path reads TMPDIR; keep it sandboxed
+        try:
+            first = drive({"transcript_path": str(log), "session_id": "s1"})
+            checks += 1
+            if "additionalContext" not in first:
+                failures.append("run_check sent no notice for a real boundary")
+            checks += 1
+            if first.count("{") and first.strip().count("\n") > 0:
+                failures.append("run_check printed more than one JSON document")
+            checks += 1
+            try:
+                json.loads(first)
+            except ValueError as exc:
+                failures.append("run_check printed something that is not one JSON "
+                                "document: %s" % exc)
+            second = drive({"transcript_path": str(log), "session_id": "s1"})
+            checks += 1
+            if second.strip():
+                failures.append("run_check announced the same boundary twice")
+            checks += 1
+            if "did not run" not in drive({"session_id": "s1"}):
+                failures.append("run_check stayed silent with no transcript in the payload")
+        finally:
+            if held is None:
+                os.environ.pop("TMPDIR", None)
+            else:
+                os.environ["TMPDIR"] = held
+
     for line in failures:
         print("FAIL " + line)
-    print(f"compaction selftest: 11 checks, {len(failures)} failures")
+    print(f"compaction selftest: {checks} checks, {len(failures)} failures")
     return 1 if failures else 0
 
 
