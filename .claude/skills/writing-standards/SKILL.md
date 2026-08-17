@@ -5,7 +5,7 @@ description: Alex's prose and document conventions. Load before drafting any pro
 
 # Writing standards
 
-Deployed copy of master §2, §7, and §11 (the master under `master/` in the home repo) — one of its two sanctioned copies. Never edit here; amend the master and regenerate (master §10).
+Deployed copy of master §2, §7, and §11 (the master at `memory/rules.md` in the home repo) — one of its two sanctioned copies. Never edit here; amend the master and regenerate (master §10).
 
 Load this skill before drafting any prose deliverable: any answer delivered as a file, or any in-chat prose answer over 300 words. Do not draft from memory of the conventions (§7.1).
 
@@ -144,7 +144,7 @@ when writing one:
 10. Lists hidden in sentences (master §7.8, testable form). Four or more parallel items in a comma-series is a list wearing a disguise — break it out where the items are things a reader may need to find again, compare, or count. This is the most common way a document that reads well still fails: the prose is fine sentence by sentence, and the reader cannot scan, count, or find one item again. A short series naming categories in passing is not caught by this. The one test with no judgement in it: parallel items that each begin with a repeating `Label:` — a date, a name, a category — are already a list, and only the line breaks are missing.
 11. Enumerated sections take the labelled-bullet shape (master §7.8, testable form). Any section whose job is to enumerate — risks, options, competitors, failure modes, requirements — runs one bullet per item as **name** → mechanism → consequence: what it is, why it happens, what it does to the reader's decision. Never a bare label with no mechanism, never a mechanism with no consequence. A section written this way is the standard the rest of the document is held to; if one section earns bullets, the enumerating sections beside it have not earned prose.
 
-<!-- Propagation stamps, checked by master/propagate.py (master §10.1). The §2 vocabulary blocks are checked by exact set equality instead and need no stamp. A stale hash does not mean this file is wrong; it means nobody has re-checked it since the master moved. -->
+<!-- Propagation stamps, checked by rules/propagate.py (master §10.1). The §2 vocabulary blocks are checked by exact set equality instead and need no stamp. A stale hash does not mean this file is wrong; it means nobody has re-checked it since the master moved. -->
 <!-- from: master §7.1 sha:22a4bbc7 -->
 <!-- from: master §7.2 sha:b06f1779 -->
 <!-- from: master §7.3 sha:7d780b4d -->

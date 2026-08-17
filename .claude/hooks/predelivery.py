@@ -24,11 +24,6 @@ import re
 import sys
 from pathlib import Path
 
-# How much of the transcript tail to read in --stop mode. One turn is far
-# smaller than this; reading the whole file costs tens of milliseconds on a
-# session that has run for hours, and buys nothing.
-TAIL_BYTES = 256 * 1024
-
 BLOCK = "block"
 WARN = "warn"
 
@@ -310,7 +305,16 @@ def load_vocabulary(root: Path | None) -> dict:
         split_at = quoted_blanked.find(" — ")
         head = body_text[:split_at] if split_at != -1 else body_text
         for quoted in re.findall(r'"([^"]{6,})"', head):
-            phrases.append((quoted, body_text))
+            # A quoted head can carry several banned phrases at once, either as
+            # alternatives inside one pair of quotes ("serves as / stands as /
+            # is a testament to") or with a trailing ellipsis standing for the
+            # rest of the sentence ("Ever wondered..."). Stored verbatim, both
+            # only matched text containing the literal slash or the literal
+            # dots, so six entries could never fire against running prose.
+            for part in quoted.split(" / "):
+                part = part.strip()
+                if len(part) >= 6:
+                    phrases.append((part, body_text))
 
     return {
         "outright": outright,
@@ -591,14 +595,15 @@ def check_vocabulary(text: str, masked: str, vocab: dict) -> list[Finding]:
     for phrase, source in vocab["phrases"]:
         if phrase.lower() in exempt:
             continue
-        placeholder = re.search(r"\b[XY]\b", phrase)
-        pattern = re.escape(phrase.lower())
-        if placeholder:
-            # `pattern` is built from the LOWERCASED phrase, so the placeholder
-            # is `x`/`y` by the time it gets here. Matching `[XY]` left every
-            # placeholder pattern byte-identical to a literal, and all twelve of
-            # them matched nothing at all until 2026-08-13.
-            pattern = re.sub(r"\\ ?[xy]\b", r"[\\w' -]{2,30}", pattern)
+        # Split on the placeholders FIRST, then escape each literal run. The old
+        # order escaped the whole phrase and substituted afterwards, so a phrase
+        # opening on a placeholder ("X — not Y — Z") kept that first placeholder
+        # literal and matched nothing. `Z` was missing from the class outright,
+        # and an ellipsis ("Ever wondered why...?") stands for the same thing:
+        # arbitrary text the writer supplies.
+        parts = re.split(r"\b[XYZ]\b|\s*\.\.\.\s*", phrase)
+        placeholder = len(parts) > 1
+        pattern = r"[\w' -]{2,30}".join(re.escape(p.lower()) for p in parts if p)
         try:
             m = re.search(pattern, lowered)
         except re.error:
@@ -852,6 +857,19 @@ def is_memory_file(path: Path, root: Path | None) -> bool:
     return bool(parts) and parts[0] == "memory" and is_home_repo(root)
 
 
+def is_capture_file(path: Path, root: Path | None) -> bool:
+    """`memory/inbox/` — Alex's own words, written by the capture hook.
+
+    Nothing here is authored for a reader and nothing here may be edited by
+    hand: the quote is what §4 protects. Checking it against the writing rules
+    reported seven paragraph breaks that a session is forbidden to fix, so the
+    sweep listed permanent work and the real backlog was seven items smaller
+    than it looked. §2 already exempts words Claude did not choose.
+    """
+    parts = Path(relative(path, root).replace("\\", "/")).parts
+    return len(parts) >= 2 and parts[0] == "memory" and parts[1] == "inbox"
+
+
 WORD_BUDGET = {
     ".claude/universal.md": 2700,
     "CLAUDE.md": 200,
@@ -891,7 +909,7 @@ def check(path: Path, content: str, root: Path | None) -> list[Finding]:
     if path.suffix.lower() not in PROSE_SUFFIXES:
         return []
     budget = check_budget(path, content, root)
-    if is_rule_file(path, root):
+    if is_rule_file(path, root) or is_capture_file(path, root):
         return budget
     masked = mask(content)
     vocab = load_vocabulary(root)
@@ -1031,12 +1049,18 @@ def _turn_text(transcript_path: str) -> tuple[list[str], str | None]:
     """
     path = Path(transcript_path)
     try:
-        size = path.stat().st_size
-        with path.open("rb") as handle:
-            if size > TAIL_BYTES:
-                handle.seek(size - TAIL_BYTES)
-                handle.readline()  # drop the partial line the seek landed in
-            raw = handle.read().decode("utf-8", errors="replace")
+        # Whole file, not a tail window. A long turn is exactly the turn most
+        # worth checking, and a 256 KB tail dropped the start of it: measured on
+        # this project's own transcript, 13 of 48 turns ran past the window, 153
+        # assistant blocks fell outside it and 16 of those carried findings the
+        # gate would have blocked. Worse, when the turn's own user entry fell
+        # outside, the backward walk below found nothing, `start` stayed 0, and
+        # the window was checked as though it were the turn.
+        #
+        # Cost measured on the same file: 428 ms to read and parse 14.6 MB
+        # against a 20 s hook timeout. compaction.py dropped tail windows for
+        # the same reason (CI-037).
+        raw = path.read_text(encoding="utf-8", errors="replace")
     except OSError as exc:
         return [], f"transcript unreadable: {exc}"
 
@@ -1300,6 +1324,40 @@ def run_selftest() -> int:
               "or its sections have moved. Vocabulary enforcement is off.", file=sys.stderr)
         return 1
 
+    # Six entries were list entries that could never fire: alternatives packed
+    # into one quoted head ("serves as / stands as / …"), an ellipsis standing
+    # for the writer's own words, and a placeholder opening the phrase. Each is
+    # checked here against a sentence someone would actually write.
+    #
+    # NOT by feeding the stored phrase back in — that probe matches its own
+    # literal and reports all 57 live, including the six dead ones.
+    for sentence in ("Ever wondered why the numbers moved?",
+                     "What if I told you the model is wrong?",
+                     "In a world where capital is scarce, this matters.",
+                     "The result serves as proof.",
+                     "This stands as the best option.",
+                     "No hedging. No caveats. Just the number.",
+                     "The checker — not the rules — is the gate here."):
+        if not check_vocabulary(sentence, mask(sentence), vocab):
+            print("predelivery selftest FAILED: a banned construction was not caught: "
+                  "%r. A phrase's notation is not reaching the matcher." % sentence,
+                  file=sys.stderr)
+            return 1
+    # And the same machinery must leave ordinary prose alone.
+    for sentence in ("The gap is five inches wide.",
+                     "We shipped the fix and measured it."):
+        if check_vocabulary(sentence, mask(sentence), vocab):
+            print("predelivery selftest FAILED: clean prose was flagged: %r" % sentence,
+                  file=sys.stderr)
+            return 1
+    # Alternatives must be split at load, or one entry silently stands for three.
+    unsplit = [p for p, _s in vocab["phrases"] if " / " in p]
+    if unsplit:
+        print("predelivery selftest FAILED: %d phrase(s) still pack alternatives into "
+              "one entry: %s" % (len(unsplit), ", ".join(repr(p) for p in unsplit[:5])),
+              file=sys.stderr)
+        return 1
+
     # A loaded list proves nothing about whether the rules fire. Each case below
     # is text the checker must catch or must leave alone. The two marked
     # `regression` reproduce bugs that shipped and went unnoticed.
@@ -1478,6 +1536,30 @@ def run_selftest() -> int:
         if "deny" in _drive_hook(clean):
             extra.append("write gate: clean prose was denied")
 
+    # The capture store is exempt, driven through the gate rather than by
+    # calling is_capture_file(). Alex's own words are not Claude's prose, and a
+    # session is forbidden to edit them, so a finding there is unfixable work.
+    with tempfile.TemporaryDirectory() as tmp:
+        home = Path(tmp)
+        (home / "memory" / "inbox").mkdir(parents=True)
+        (home / ".git").mkdir()          # what find_repo_root actually looks for
+        (home / "memory" / "map.md").write_text("# Memory map\n", encoding="utf-8")
+        wordy = ("> a quote\nabout: One sentence. A second sentence. A third sentence. "
+                 "A fourth sentence lands here.\n")
+        capture = home / "memory" / "inbox" / "2026-08-13.md"
+        spoken = _drive_hook({"tool_name": "Write", "tool_input": {
+            "file_path": str(capture), "content": "# Feedback\n\n" + wordy}})
+        if "deny" in spoken or "paragraph" in spoken:
+            extra.append("capture store: a verbatim record was checked as Claude's prose "
+                         "(got %r)" % spoken[:140])
+        # The exemption is the inbox, not all of memory/ — a node is authored.
+        node = home / "memory" / "claude-improvement.md"
+        spoken = _drive_hook({"tool_name": "Write", "tool_input": {
+            "file_path": str(node), "content": "# Domain\n\n" + wordy}})
+        if "paragraph" not in spoken:
+            extra.append("capture store: the exemption leaked to an authored domain file "
+                         "(got %r)" % spoken[:140])
+
     # The Stop gate, end to end. run_stop() and _turn_text() had no test at
     # all: the chat check could be stubbed to nothing and the suite stayed
     # green while every message shipped unchecked (audit round three).
@@ -1501,6 +1583,25 @@ def run_selftest() -> int:
             encoding="utf-8")
         if "1.3a" in _drive_stop({"transcript_path": str(log)}):
             extra.append("chat gate: a clean list was blocked")
+
+        # A long turn is the one most worth checking, and the gate used to read
+        # only the last 256 KB of the transcript — so text written before a big
+        # tool result in the same turn shipped unchecked. The bulk here is one
+        # tool_result larger than that old window, sitting between the break and
+        # the end of the file.
+        bulk = "x" * (300 * 1024)
+        log.write_text(
+            _j.dumps({"type": "user", "message": {"content": "go"}}) + "\n" +
+            _j.dumps({"type": "assistant",
+                      "message": {"content": [{"type": "text", "text": bad}]}}) + "\n" +
+            _j.dumps({"type": "user", "message": {"content": [
+                {"type": "tool_result", "content": bulk}]}}) + "\n" +
+            _j.dumps({"type": "assistant", "message": {"content": [
+                {"type": "text", "text": "- one\n- two"}]}}) + "\n",
+            encoding="utf-8")
+        if "1.3a" not in _drive_stop({"transcript_path": str(log)}):
+            extra.append("chat gate: a break before a 300 KB tool result was not seen — "
+                         "the turn is being read through a tail window")
 
     for line in extra:
         print(f"  FAIL {line}")
