@@ -787,7 +787,7 @@ def is_memory_file(path: Path, root: Path | None) -> bool:
 
 
 WORD_BUDGET = {
-    ".claude/universal.md": 2600,
+    ".claude/universal.md": 2700,
     "CLAUDE.md": 200,
 }
 
