@@ -1225,15 +1225,29 @@ def run_stop() -> int:
                           f"short ({', '.join(thin)}). Run predelivery.py --selftest."}))
         return 0
 
-    findings = []
-    for text in blocks:
-        masked = mask(text)
-        # §1.3a, not §7.8: anything addressed to Alex directly caps at two
-        # consecutive sentences. The gate had been set one notch looser than the
-        # rule it enforces since it shipped.
-        findings += [f for f in chat_findings(text, vocab)
-                     if f.severity == BLOCK]
+    # Only the last block can still be changed. A turn ends with everything it
+    # said still in the transcript, so checking all of it re-reports findings in
+    # narration Alex read twenty tool calls ago — text a rewrite cannot touch.
+    # Measured 2026-08-18: seventeen blocks in one turn, and the block message
+    # carried findings from eleven of them, none of them fixable. A gate that
+    # asks for the impossible is a gate that gets ignored.
+    #
+    # §1.3a, not §7.8: anything addressed to Alex directly caps at two
+    # consecutive sentences. The gate had been set one notch looser than the
+    # rule it enforces since it shipped.
+    findings = [f for f in chat_findings(blocks[-1], vocab) if f.severity == BLOCK]
+    # Earlier blocks are still checked, and still reported — as context, never as
+    # the reason for the block. What they buy is the count: a turn that narrated
+    # badly and then wrote a clean final message should say so, not read clean.
+    earlier = []
+    for text in blocks[:-1]:
+        earlier += [f for f in chat_findings(text, vocab) if f.severity == BLOCK]
     if not findings:
+        if earlier:
+            print(json.dumps({"systemMessage":
+                              "chat check: the message just sent is clean, but %d break(s) "
+                              "went out earlier in this turn and cannot now be rewritten. "
+                              "They are the ones worth not repeating." % len(earlier)}))
         return 0
 
     lines = []
@@ -1650,6 +1664,10 @@ def run_selftest() -> int:
         # tool result in the same turn shipped unchecked. The bulk here is one
         # tool_result larger than that old window, sitting between the break and
         # the end of the file.
+        # The turn is read whole, not through a tail window. Asserted on
+        # _turn_text rather than through the gate: the gate now blocks on the
+        # last block alone, so a window that drops earlier ones is invisible
+        # from outside. What broke was the reading, so the reading is the test.
         bulk = "x" * (300 * 1024)
         log.write_text(
             _j.dumps({"type": "user", "message": {"content": "go"}}) + "\n" +
@@ -1660,9 +1678,36 @@ def run_selftest() -> int:
             _j.dumps({"type": "assistant", "message": {"content": [
                 {"type": "text", "text": "- one\n- two"}]}}) + "\n",
             encoding="utf-8")
+        seen_blocks, read_error = _turn_text(str(log))
+        if read_error or len(seen_blocks) != 2 or bad not in seen_blocks[0]:
+            extra.append("chat gate: text written before a 300 KB tool result was not read "
+                         "back — the turn is being read through a tail window (got %d block(s), "
+                         "error %r)" % (len(seen_blocks), read_error))
+        # And the gate blocks on the last block, which is the only one a rewrite
+        # can still change.
+        log.write_text(
+            _j.dumps({"type": "user", "message": {"content": "go"}}) + "\n" +
+            _j.dumps({"type": "assistant", "message": {"content": [
+                {"type": "text", "text": "- one\n- two"}]}}) + "\n" +
+            _j.dumps({"type": "assistant",
+                      "message": {"content": [{"type": "text", "text": bad}]}}) + "\n",
+            encoding="utf-8")
         if "1.3a" not in _drive_stop({"transcript_path": str(log)}):
-            extra.append("chat gate: a break before a 300 KB tool result was not seen — "
-                         "the turn is being read through a tail window")
+            extra.append("chat gate: a break in the final message was not blocked")
+        # A break in an earlier block, with a clean final message, does not block
+        # — it cannot be rewritten — but it is still reported.
+        log.write_text(
+            _j.dumps({"type": "user", "message": {"content": "go"}}) + "\n" +
+            _j.dumps({"type": "assistant",
+                      "message": {"content": [{"type": "text", "text": bad}]}}) + "\n" +
+            _j.dumps({"type": "assistant", "message": {"content": [
+                {"type": "text", "text": "- one\n- two"}]}}) + "\n",
+            encoding="utf-8")
+        spoken = _drive_stop({"transcript_path": str(log)})
+        if "block" in spoken:
+            extra.append("chat gate: blocked on text a rewrite cannot reach")
+        if "earlier in this turn" not in spoken:
+            extra.append("chat gate: an earlier break went unreported (got %r)" % spoken[:120])
 
         # §1.6, the plain-English rule, which nothing enforced until Alex said
         # the conversation "looks alien" for the third time. Driven through the
