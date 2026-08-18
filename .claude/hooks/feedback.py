@@ -32,6 +32,7 @@ says so in a systemMessage rather than passing silently.
 """
 
 import contextlib
+import datetime
 import fcntl
 import hashlib
 import json
@@ -88,6 +89,19 @@ MACHINE = re.compile(
     r"(?:please\s+)?continue from where you left off|"
     r"\[Request interrupted by user)",
     re.I)
+
+
+def today_utc():
+    """The day, on the same clock the transcript stamps.
+
+    `date.today()` is the machine's LOCAL calendar date, and every transcript
+    entry is stamped UTC. For any machine not on UTC there is a window every day
+    where the two disagree — and the day is baked into a record's id and into
+    the sweep's key, so one message became two records under two days, splitting
+    the count and making the sweep report a message the prompt hook had recorded
+    seconds earlier as never recorded (panel round 4, 2026-08-18).
+    """
+    return datetime.datetime.now(datetime.timezone.utc).date().isoformat()
 
 
 def repo_root(start):
@@ -444,7 +458,7 @@ def sweep(payload, root=None, today=None):
     no second entry.
     """
     root = root or repo_root(payload.get("cwd") or os.getcwd())
-    fallback = today or __import__("datetime").date.today().isoformat()
+    fallback = today or today_utc()
     folder, _home = inbox(root)
 
     def stored():
@@ -522,11 +536,19 @@ def sweep(payload, root=None, today=None):
 
 
 def set_seen(day_file, ident, count):
-    """Set a record's `seen:` to a number, rather than adding one to it.
+    """Raise a record's `seen:` to a number. Never lower it.
 
     The sweep reads the whole transcript every turn, so incrementing would climb
-    once per turn for something said once. Setting it from the count in the
-    transcript is idempotent.
+    once per turn for something said once — setting it from the transcript's own
+    count is what makes a re-sweep idempotent.
+
+    But the store is per day and a transcript is per session. A correction
+    repeated on the same day in a SECOND session gives that session's sweep a
+    count of one, and assigning it wrote the accumulated count back down. The
+    count is the only thing this store measures. install/harvest.py's
+    refreshed() already refuses to lower a count for records carried in from
+    other repos; this is the same guard on the home repo's own day files (panel
+    round 4, 2026-08-18).
     """
     try:
         body = Path(day_file).read_text(encoding="utf-8", errors="replace")
@@ -537,7 +559,11 @@ def set_seen(day_file, ident, count):
         if line.startswith("## "):
             inside = line[3:].strip() == ident
         if inside and line.startswith("seen: "):
-            want = "seen: %d" % count
+            try:
+                held = int(line[6:].strip())
+            except ValueError:
+                held = 0
+            want = "seen: %d" % max(count, held)
             changed = changed or line != want
             line = want
         out.append(line)
@@ -553,7 +579,7 @@ def capture(payload, root=None, today=None, about=None):
     if MACHINE.match(text):
         return None, "machine-generated turn, not Alex", []
     root = root or repo_root(payload.get("cwd") or os.getcwd())
-    day = today or __import__("datetime").date.today().isoformat()
+    day = today or today_utc()
     folder, _home = inbox(root)
     try:
         folder.mkdir(parents=True, exist_ok=True)
@@ -1335,6 +1361,42 @@ def run_selftest():
         first = (root / "memory" / "inbox" / "2026-08-20.md").read_text(encoding="utf-8")
         check("and the first day's record is not touched by the second",
               first.count(words) == 1 and "seen: 1" in first, first[-260:])
+
+        # The prompt hook dated a record by the LOCAL calendar and the sweep dates
+        # it by the transcript's stamp, which is always UTC. For any machine not
+        # on UTC there is a window every day where the two disagree, and one
+        # message becomes two records under two days — splitting the count and
+        # making the sweep report a message the prompt hook had just recorded as
+        # never recorded (panel round 4, 2026-08-18).
+        check("the capture day is the same clock the transcript uses",
+              today_utc() == __import__("datetime").datetime.now(
+                  __import__("datetime").timezone.utc).date().isoformat(),
+              today_utc())
+
+        # A count never falls. The sweep sets it from THIS transcript, which is
+        # right against re-sweeping the same one and wrong across sessions: a
+        # correction repeated on the same day in a second session was written
+        # back down to one, and the count is the only thing this store measures.
+        # install/harvest.py's refreshed() already refuses to lower a count for
+        # records carried in from other repos; this is the same guard on the
+        # home repo's own day files (panel round 4, 2026-08-18).
+        first = root / "sessionA.jsonl"
+        second = root / "sessionB.jsonl"
+        words = "stop rewriting the summary"
+        entry = {"type": "attachment", "timestamp": "2026-08-26T09:00:00.000Z",
+                 "attachment": {"type": "queued_command", "prompt": words},
+                 "origin": {"kind": "human"}}
+        first.write_text("\n".join(json.dumps(entry) for _ in range(2)) + "\n",
+                         encoding="utf-8")
+        second.write_text(json.dumps(entry) + "\n", encoding="utf-8")
+        sweep({"transcript_path": str(first), "cwd": str(root)}, root=root)
+        day_a = (root / "memory" / "inbox" / "2026-08-26.md").read_text(encoding="utf-8")
+        check("two occurrences in one session are counted", "seen: 2" in day_a, day_a[-260:])
+        sweep({"transcript_path": str(second), "cwd": str(root)}, root=root)
+        day_b = (root / "memory" / "inbox" / "2026-08-26.md").read_text(encoding="utf-8")
+        check("a later session holding fewer does not write the count back down",
+              "seen: 2" in day_b and "seen: 1" not in day_b.split("> " + words)[0][-120:],
+              day_b[-260:])
 
         # And a record carried home from ANOTHER repo must not shadow the same
         # words typed here. record_id puts the repo in its key for exactly this

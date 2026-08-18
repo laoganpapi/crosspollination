@@ -890,8 +890,19 @@ def check_ledger(path: Path, masked: str, root: Path | None) -> list[Finding]:
         if extra is not None:
             pool += extra
     entries = "\n".join(line for line in pool.splitlines() if LEDGER_ENTRY.match(line))
-    recorded = {m.group(0).lower().replace(" ", "") for m in FIGURE.finditer(entries)}
-    missing = sorted(f for f in figures if f.lower().replace(" ", "") not in recorded)
+    # Whitespace of every kind, not spaces alone. FIGURE's trailing `\s*` runs
+    # past the end of a line and the `\b` after it is satisfied by the next
+    # line's first word character, so a figure at the end of a line is captured
+    # WITH its newline. A ledger entry never hits that path — it starts with a
+    # bullet, so the boundary fails and the run backtracks to nothing — and the
+    # comparison stripped spaces only. A figure recorded verbatim was reported
+    # as unrecorded, which is the §3.3 gate demanding work already done (panel
+    # round 4, 2026-08-18).
+    def tidy(figure):
+        return "".join(figure.split()).lower()
+
+    recorded = {tidy(m.group(0)) for m in FIGURE.finditer(entries)}
+    missing = sorted({tidy(f) for f in figures} - recorded)
     if not missing:
         return []
     sample = ", ".join(missing[:4])
@@ -1135,7 +1146,14 @@ def run_hook() -> int:
     # wrote "innovative" three paragraphs away teaches a session to route
     # around the hook entirely. Pre-existing breaks still surface as warnings.
     before = read_text(path)
-    if before is not None and before != content:
+    # Not `before != content`. An Edit whose old_string is absent, or a Write of
+    # unchanged bytes, rebuilds to the file exactly — and gating the carve-out on
+    # a change meant those were denied for words the write did not introduce,
+    # with the tool's own "string not found" error replaced by a rule reason the
+    # session could not act on. When nothing changed, every finding is
+    # pre-existing and every one demotes, which is the right answer (panel round
+    # 4, 2026-08-18).
+    if before is not None:
         prior = {(f.rule, f.message, f.span) for f in check(path, before, root)}
         findings = demote_known(findings, prior)
 
@@ -1338,11 +1356,6 @@ def run_stop() -> int:
     root = find_repo_root(Path.cwd())
     vocab = load_vocabulary(root)
     thin = [name for name, least in VOCAB_FLOOR.items() if len(vocab[name]) < least]
-    if thin:
-        print(json.dumps({"systemMessage":
-                          f"chat check ran without §2: the writing-standards skill loaded "
-                          f"short ({', '.join(thin)}). Run predelivery.py --selftest."}))
-        return 0
 
     # Only the last block can still be changed. A turn ends with everything it
     # said still in the transcript, so checking all of it re-reports findings in
@@ -1361,6 +1374,12 @@ def run_stop() -> int:
     earlier = []
     for text in blocks[:-1]:
         earlier += [f for f in chat_findings(text, vocab) if f.severity == BLOCK]
+    if not findings and thin:
+        print(json.dumps({"systemMessage":
+                          "chat check: §2 was not checked — the writing-standards skill loaded "
+                          "short (%s). The rest of the gate ran and found nothing. Run "
+                          "predelivery.py --selftest." % ", ".join(thin)}))
+        return 0
     if not findings:
         if earlier:
             print(json.dumps({"systemMessage":
@@ -1370,6 +1389,17 @@ def run_stop() -> int:
         return 0
 
     lines = []
+    if thin:
+        # A short vocabulary is not a reason to stop checking. Two of the three
+        # checks here need no vocabulary at all — the two-sentence cap and the
+        # plain-English rule — and returning before them switched the whole
+        # chat gate off while the message claimed the check had "run without
+        # §2". load_vocabulary's own docstring promises the structural checks
+        # survive a missing skill; this was the one caller that broke it (panel
+        # round 4, 2026-08-18).
+        lines.append("- the writing-standards skill loaded short (%s), so §2 was NOT checked "
+                     "at all. What follows is the rest of the gate. Run "
+                     "predelivery.py --selftest." % ", ".join(thin))
     for finding in findings:
         if finding.rule == "paragraph":
             # Splitting the paragraph clears the check and manufactures §7.10's
@@ -1471,7 +1501,7 @@ def run_files(paths: list[str]) -> int:
     return worst
 
 
-def _drive_stop(payload) -> str:
+def _drive_stop(payload, vocab=None) -> str:
     """Run the Stop gate the way the harness does: JSON on stdin."""
     import io
     import json as _json
@@ -1479,6 +1509,11 @@ def _drive_stop(payload) -> str:
     saved = sys.stdin
     sys.stdin = io.StringIO(_json.dumps(payload))
     buffer = io.StringIO()
+    # `vocab` forces what load_vocabulary returns, so the thin-skill path can be
+    # driven through the real gate rather than asserted against a helper.
+    loader = globals()["load_vocabulary"]
+    if vocab is not None:
+        globals()["load_vocabulary"] = lambda _root: vocab
     try:
         with redirect_stdout(buffer):
             run_stop()
@@ -1486,6 +1521,7 @@ def _drive_stop(payload) -> str:
         pass
     finally:
         sys.stdin = saved
+        globals()["load_vocabulary"] = loader
     return buffer.getvalue()
 
 
@@ -1740,6 +1776,31 @@ def run_selftest() -> int:
     # and had the name resolved the call would have raised (panel round 3,
     # 2026-08-18). Driven through load_vocabulary, which is what production
     # calls.
+    # An Edit whose old_string is absent, or a Write of unchanged bytes, rebuilds
+    # to the file exactly — and the carve-out that spares a file's pre-existing
+    # breaks was gated on the content having CHANGED. So the write was denied
+    # for words it did not introduce, and the tool's own "string not found"
+    # error was replaced by a rule reason the session could not act on. Four
+    # files in this repo carry blocking findings against their own current
+    # content, so it is reachable today (panel round 4, 2026-08-18).
+    with tempfile.TemporaryDirectory() as tmp:
+        here = Path(tmp)
+        (here / ".claude").mkdir()
+        note = here / "note.md"
+        note.write_text("One innovative thing.\n\nA second innovative thing.\n", encoding="utf-8")
+        for label, payload in (
+                ("an Edit whose old_string is absent",
+                 {"tool_name": "Edit", "tool_input": {"file_path": str(note),
+                                                      "old_string": "NOT PRESENT",
+                                                      "new_string": "x"}, "cwd": str(here)}),
+                ("a Write of unchanged bytes",
+                 {"tool_name": "Write", "tool_input": {"file_path": str(note),
+                                                       "content": note.read_text(encoding="utf-8")},
+                  "cwd": str(here)})):
+            if '"permissionDecision": "deny"' in _drive_hook(payload):
+                extra.append("demotion: %s must not be denied for a break the file already "
+                             "carried" % label)
+
     # The litotes check reported the FIRST match and stopped, with an empty
     # span, so a file already carrying one produced a byte-identical finding
     # before and after a write that added another — demoted to a warning
@@ -1753,6 +1814,60 @@ def run_selftest() -> int:
     if not [f for f in now if (f.rule, f.message, f.span) not in was]:
         extra.append("litotes: a second one added to a file that already carried one must stay "
                      "a block, not demote behind the first")
+
+    # A short vocabulary switched the WHOLE chat gate off, including the two
+    # checks that need no vocabulary at all — the two-sentence cap and the
+    # plain-English rule. The message printed said the check "ran without §2",
+    # which asserts the rest ran; none of it did. One deleted banned opener is
+    # enough to trigger it, since that list loads exactly at its floor (panel
+    # round 4, 2026-08-18).
+    dark = ("I merged the pull request into the branch. One sentence here. A second follows. "
+            "And a third lands.")
+    with tempfile.TemporaryDirectory() as tmp:
+        here = Path(tmp)
+        (here / ".claude" / "skills" / "writing-standards").mkdir(parents=True)
+        real = Path(__file__).resolve().parents[1] / "skills" / "writing-standards" / "SKILL.md"
+        (here / ".claude" / "skills" / "writing-standards" / "SKILL.md").write_text(
+            real.read_text(encoding="utf-8").replace("\n### ", "\n#### "), encoding="utf-8")
+        log = here / "t.jsonl"
+        log.write_text(json.dumps(
+            {"type": "assistant", "message": {"content": [{"type": "text", "text": dark}]}}
+        ) + "\n", encoding="utf-8")
+        spoken = _drive_stop({"transcript_path": str(log), "cwd": str(here)},
+                             vocab={"outright": [], "replace": {}, "sense": {},
+                                    "openers": [], "phrases": []})
+    if '"decision": "block"' not in spoken:
+        extra.append("thin vocabulary: the two-sentence cap and the plain-English rule need no "
+                     "vocabulary, so a short skill must not switch the whole gate off (said %r)"
+                     % spoken[:120])
+    if "1.3a" not in spoken or "1.6" not in spoken:
+        extra.append("thin vocabulary: both vocabulary-free checks must still be reported "
+                     "(said %r)" % spoken[:160])
+    if "NOT checked" not in spoken:
+        extra.append("thin vocabulary: the message must say §2 was not checked, not imply the "
+                     "check ran without it")
+
+    # FIGURE's trailing `\s*` runs past the end of a line and `\b` is satisfied
+    # by the next line's first word character, so the captured figure carries a
+    # newline. The ledger comparison stripped spaces and not newlines, so a
+    # figure recorded verbatim was reported as unrecorded — the §3.3 gate
+    # demanding work already done (panel round 4, 2026-08-18).
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        (root / ".claude").mkdir()
+        (root / "CLAUDE.md").write_text(
+            "# x\n\n- **Ledger:** `ledger.md` at the repo root.\n", encoding="utf-8")
+        (root / "ledger.md").write_text(
+            "- [2026-08-18] deposit — $5,000 paid 1 Aug\n"
+            "- [2026-08-18] fee — $12,500 agreed\n"
+            "- [2026-08-18] retainer — $250 monthly\n", encoding="utf-8")
+        note = root / "8 18 26 deal note.md"
+        doc = ("The fee is $12,500\n\nThe retainer is $250\n\nThe deposit is $5,000\n"
+               "Paid on 1 August.\n")
+        said = check_ledger(note, mask(doc), root)
+        if said:
+            extra.append("ledger: figures recorded verbatim were reported as unrecorded (%s)"
+                         % said[0].message[:120])
 
     spread = comma_words("alpha, beta\ngamma, delta — with a note\n")
     for term in ("alpha", "beta", "gamma", "delta"):
