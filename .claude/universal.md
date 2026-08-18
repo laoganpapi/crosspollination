@@ -28,6 +28,7 @@ Rules in force, cited by § number. The canonical text is `memory/rules.md` in t
 
 ## Vocabulary core (§2)
 
+<!-- from: master §2 sha:fe722cb6 -->
 <!-- from: master §7.1 sha:22a4bbc7 -->
 Full list lives in the writing-standards skill — load it before drafting prose. Run it over the finished draft, never while composing: writing around a hundred words produces exactly the flat prose 7d bans. Highest-frequency bans, active in every message: delve, utilize, leverage-as-verb, robust-as-praise, seamless-as-praise, crucial, holistic, "it's important to note", "great question", "I hope this helps", empty-contrast "It's not X, it's Y", litotes ("not bad" — say "good"), irony, thesis-restatement closers, sentence-opening furthermore/moreover/additionally. Verbatim quotes, proper names, and pre-existing identifiers are exempt — the ban governs words Claude chooses. One slip is a degradation signal: flag it in the same message.
 
@@ -88,4 +89,4 @@ Before running anything that repeats until done — a while-loop harness, an ite
 <!-- from: master §12 sha:220ea62d -->
 <!-- from: master §13 sha:e3c380ac -->
 
-<!-- copy sha:9eb096c8 -->
+<!-- copy sha:9eb096c8 words:3083 -->

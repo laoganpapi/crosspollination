@@ -79,6 +79,13 @@ MACHINE = re.compile(
     # Alex: the first is a compaction summary written by another pass, the second
     # a marker the interface inserts. Both were swept as things he said.
     r"This session is being continued from a previous conversation|"
+    # The harness sends this as an ordinary prompt when it resumes a session
+    # after a limit reset or an interrupt. It reached the store three times,
+    # once at `seen: 6` — a record claiming Alex repeated an instruction six
+    # times in a day he never said it once. The graph named the string as
+    # harness text on 2026-08-17 and it recurred on 2026-08-18, because naming
+    # it was not the same as adding it here (panel round 2).
+    r"(?:please\s+)?continue from where you left off|"
     r"\[Request interrupted by user)",
     re.I)
 
@@ -376,6 +383,21 @@ def turn_messages(transcript_path):
     return out
 
 
+def where_of(lines):
+    """The repo a stored record came from, off its location line.
+
+    A record written here carries this repo's remote; one carried in by the
+    harvest carries the repo it was typed in, on its own `from:` line.
+    """
+    for line in lines:
+        if line.startswith("from: "):
+            return line[6:].strip()
+    for line in lines:
+        if " · " in line:
+            return line.split(" · ")[0].strip()
+    return ""
+
+
 def sweep(payload, root=None, today=None):
     """Record anything said this session that the store does not already hold.
 
@@ -413,15 +435,22 @@ def sweep(payload, root=None, today=None):
                                        for line in quote_of(lines))
                     # The day comes off the id, which carries it, rather than
                     # off the filename — a harvested record keeps its own day.
+                    # The repo belongs in the key too, for the reason record_id
+                    # gives: `harvested.md` sits in this folder, so the same
+                    # words on the same day in another repo shadowed the home
+                    # record entirely — no entry, no count, no day file. The
+                    # docstring above claimed that closed and it was not (panel
+                    # round 2, 2026-08-18).
                     day = ident[3:13]
-                    seen[(day, normalise(quote))] = ident
+                    seen[(day, where_of(lines), normalise(quote))] = ident
                     ids.add(ident)
         return seen, ids
 
+    home = origin(root)
     already, known_ids = stored()
     added = []
     for text, about, said_on in turn_messages(payload.get("transcript_path")):
-        key = (said_on or fallback, normalise(redact(text)))
+        key = (said_on or fallback, home, normalise(redact(text)))
         if key in already:
             continue
         # The id too, not only the words. A record whose quote was replaced —
@@ -1099,8 +1128,10 @@ def run_selftest():
         # asserts on purpose.
         hand = root / "memory" / "inbox" / "2026-08-15.md"
         hand.write_text("# Feedback captured 2026-08-15\n\n"
-                        "## fb-2026-08-15-0000000000\nwhere\nsignals: none\nseen: 1\n"
-                        "status: new\n\n> already here under another id\n\n", encoding="utf-8")
+                        "## fb-2026-08-15-0000000000\n%s · b · 2026-08-15\n"
+                        "signals: none\nseen: 1\n"
+                        "status: new\n\n> already here under another id\n\n"
+                        % origin(root), encoding="utf-8")
         dupe_log = root / "dupe.jsonl"
         dupe_log.write_text(json.dumps(
             {"type": "attachment", "timestamp": "2026-08-15T09:00:00.000Z",
@@ -1194,6 +1225,19 @@ def run_selftest():
         quiet = sweep({"transcript_path": str(noise), "cwd": str(root)}, root=root)
         check("a compaction summary is not recorded as Alex", quiet == [], repr(quiet))
 
+        # The harness resumes a stopped session by sending this as an ordinary
+        # prompt. It reached the store three times, once at seen: 6 — a record
+        # claiming Alex repeated an instruction six times that day. The graph had
+        # already named the string as harness text without the code changing, and
+        # it recurred after that (panel round 2, 2026-08-18).
+        for resume in ("Continue from where you left off.",
+                       "Continue from where you left off",
+                       "Please continue from where you left off."):
+            check("the harness resume text is not read as Alex (%r)" % resume[:24],
+                  bool(MACHINE.match(resume)), resume)
+        check("a real message beginning with continue is still Alex",
+              not MACHINE.match("continue with the second half, then stop"), "")
+
         # De-duplication is per day, the way `capture` and `record_id` are. Keyed
         # on the words alone across every day file, the same words said again on
         # a later day were dropped with no record and no count — which is the
@@ -1215,6 +1259,28 @@ def run_selftest():
         first = (root / "memory" / "inbox" / "2026-08-20.md").read_text(encoding="utf-8")
         check("and the first day's record is not touched by the second",
               first.count(words) == 1 and "seen: 1" in first, first[-260:])
+
+        # And a record carried home from ANOTHER repo must not shadow the same
+        # words typed here. record_id puts the repo in its key for exactly this
+        # reason; the sweep's key did not, so the home record was never written
+        # — no entry, no count, no day file (panel round 2, 2026-08-18).
+        (root / "memory" / "inbox" / "harvested.md").write_text(
+            "# Feedback harvested from other repos\n\n"
+            "## fb-2026-08-22-1111111111\n"
+            "https://github.com/laoganpapi/Venture-Deals · main · 2026-08-22\n"
+            "signals: none\nseen: 1\nstatus: new\n\n> merge\n"
+            "from: laoganpapi/Venture-Deals\n", encoding="utf-8")
+        away = root / "away.jsonl"
+        away.write_text(json.dumps(
+            {"type": "attachment", "timestamp": "2026-08-22T15:00:00.000Z",
+             "attachment": {"type": "queued_command", "prompt": "merge"},
+             "origin": {"kind": "human"}}) + "\n", encoding="utf-8")
+        landed = sweep({"transcript_path": str(away), "cwd": str(root)}, root=root)
+        check("the same words in another repo do not shadow the home record",
+              len(landed) == 1, repr(landed))
+        check("and the away record is left alone",
+              "seen: 1" in (root / "memory" / "inbox" / "harvested.md").read_text(encoding="utf-8"),
+              "")
 
     for line in failures:
         print("FAIL " + line)

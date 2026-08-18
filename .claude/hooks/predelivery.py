@@ -446,7 +446,13 @@ def mask(text: str) -> str:
         before = partial[m.start() - 1] if m.start() else " "
         after = partial[m.end()] if m.end() < len(partial) else " "
         if open_straight is None:
-            if after.isspace() or after in ")]}.,;:!?":
+            # An ellipsis is how a fragment is quoted mid-sentence, and `.`
+            # sits in the reject set — so `"...we utilize a holistic fee
+            # schedule."` was never masked and §4.1 source text was scanned as
+            # Claude's own prose. Deleting the three dots and nothing else made
+            # the same write pass (panel round 2, 2026-08-18).
+            ellipsis = partial[m.end():m.end() + 3] == "..."
+            if not ellipsis and (after.isspace() or after in ")]}.,;:!?"):
                 continue          # cannot open a quotation
             open_straight = m.start()
         else:
@@ -636,10 +642,16 @@ def check_vocabulary(text: str, masked: str, vocab: dict) -> list[Finding]:
                                  span=f"{word}×{len(hits)}"))
 
     for word in vocab["openers"]:
-        for m in re.finditer(rf"(?:^|(?<=[.!?])\s+){re.escape(word)}\b", lowered, re.MULTILINE):
-            found.append(Finding(BLOCK, "banned-opener", line_of(masked, m.start()),
-                                 f"master §2 bans {word!r} as a sentence-opening transition."))
-            break
+        # The count in the span, same as the three lists above. Without it the
+        # finding is byte-identical however many uses there are, so run_hook's
+        # demotion — which spares a file's pre-existing breaks — waved through
+        # every new one (panel round 2, 2026-08-18).
+        opens = list(re.finditer(rf"(?:^|(?<=[.!?])\s+){re.escape(word)}\b", lowered,
+                                 re.MULTILINE))
+        if opens:
+            found.append(Finding(BLOCK, "banned-opener", line_of(masked, opens[0].start()),
+                                 f"master §2 bans {word!r} as a sentence-opening transition.",
+                                 span=f"{word}×{len(opens)}"))
 
     for phrase, source in vocab["phrases"]:
         if phrase.lower() in exempt:
@@ -654,13 +666,14 @@ def check_vocabulary(text: str, masked: str, vocab: dict) -> list[Finding]:
         placeholder = len(parts) > 1
         pattern = r"[\w' -]{2,30}".join(re.escape(p.lower()) for p in parts if p)
         try:
-            m = re.search(pattern, lowered)
+            hits = list(re.finditer(pattern, lowered))
         except re.error:
             continue
-        if m:
+        if hits:
             severity = WARN if placeholder else BLOCK
-            found.append(Finding(severity, "banned-phrase", line_of(masked, m.start()),
-                                 f"master §2: {source}"))
+            found.append(Finding(severity, "banned-phrase", line_of(masked, hits[0].start()),
+                                 f"master §2: {source}",
+                                 span=f"{phrase.lower()}×{len(hits)}"))
     return found
 
 
@@ -935,6 +948,13 @@ def check_budget(path: Path, content: str, root: Path | None) -> list[Finding]:
     """
     rel = relative(path, root).replace("\\", "/")
     budget = WORD_BUDGET.get(rel)
+    if budget is None and Path(rel).name == "CLAUDE.local.md":
+        # install.sh names the bundle's file CLAUDE.local.md whenever the target
+        # already owns a CLAUDE.md, so §5.1a was unenforced in exactly the repos
+        # Alex does not own. check_ledger one function below documents that split
+        # and handles it; this made the mistake that comment names (panel round
+        # 2, 2026-08-18).
+        budget, rel = WORD_BUDGET["CLAUDE.md"], "CLAUDE.local.md"
     if budget is None:
         return []
     # The 200-word cap is on the CLAUDE.md this system installs, and that file
@@ -1320,7 +1340,7 @@ def run_stop() -> int:
     return 0
 
 
-def run_text(path_name: str) -> int:
+def run_text(path_name: str, chat: bool = False) -> int:
     """Check a block of prose that is not a deliverable file.
 
     Used for chat replies and for pasted output handed to the audit loop
@@ -1347,7 +1367,13 @@ def run_text(path_name: str) -> int:
     vocab = load_vocabulary(root)
     thin = [name for name, least in VOCAB_FLOOR.items() if len(vocab[name]) < least]
     masked = mask(content)
-    findings = check_vocabulary(content, masked, vocab) + check_structure(masked)
+    # `chat` runs exactly what the Stop gate runs, so the two cannot drift.
+    # `--text` alone ran the FILE prose cap and no plain-speech check at all,
+    # and the output-audit skill uses its exit code as the loop's machine
+    # success condition — so the loop could declare a redraft clean while the
+    # chat gate blocked the same words five times (panel round 2, 2026-08-18).
+    findings = (chat_findings(content, vocab) if chat
+                else check_vocabulary(content, masked, vocab) + check_structure(masked))
 
     payload = {
         "words": len(content.split()),
@@ -1571,6 +1597,38 @@ def run_selftest() -> int:
     if [f for f in check_vocabulary(kept, mask(kept), vocab)
             if (f.rule, f.message, f.span) not in seen]:
         extra.append("demotion: an unchanged file must not report its own word as new")
+
+    # Round one gave the occurrence count to three of the five §2 lists and left
+    # the other two, so a file already holding one banned opener or one banned
+    # phrase absorbed unlimited further uses — §2 switched off for those lists
+    # for the life of the file, which is the defect the count was written to
+    # close (panel round 2, 2026-08-18).
+    # Walking the lists, not a word: the fix reached three of five and the tests
+    # written for it passed, because they were written against the three it
+    # touched. A check that names the lists fails the moment one is left behind.
+    countless = [rule for rule, sample in (("banned-word", "utilize this"),
+                                           ("banned-opener", "One. Furthermore, two."),
+                                           ("banned-phrase", "It serves as a buffer."))
+                 for f in check_vocabulary(sample, mask(sample), vocab)
+                 if f.rule == rule and "\u00d7" not in f.span]
+    if countless:
+        extra.append("demotion: %s finding(s) carry no occurrence count, so a second use "
+                     "demotes behind the first: %s" % (len(countless), ", ".join(sorted(set(countless)))))
+
+    for label, before_text, after_text in [
+            ("opener",
+             "The build finished. Furthermore, the tests ran clean.\n",
+             "The build finished. Furthermore, the tests ran clean.\n\n"
+             "The report is ready. Furthermore, the numbers agree.\n"),
+            ("phrase",
+             "The cache serves as a buffer.\n",
+             "The cache serves as a buffer.\n\nThe queue serves as a spool.\n")]:
+        was = {(f.rule, f.message, f.span)
+               for f in check_vocabulary(before_text, mask(before_text), vocab)}
+        now = check_vocabulary(after_text, mask(after_text), vocab)
+        if not [f for f in now if (f.rule, f.message, f.span) not in was]:
+            extra.append("demotion: a second banned %s in a file that already carried one "
+                         "must stay a block, not demote behind the first" % label)
 
     # A term stored with its grammatical annotation is a key no prose contains,
     # so the ban loads and can never fire. "deep-dive (noun or verb)" was banned
@@ -1850,6 +1908,55 @@ def run_selftest() -> int:
         if "1.6" in spoken:
             extra.append("write gate: the plain-English rule leaked onto a deliverable")
 
+    # A quotation opening on an ellipsis was never masked, so §4.1 source text
+    # was scanned as Claude's own prose and the write denied. One character of
+    # punctuation inside a quotation flipped the verdict (panel round 2,
+    # 2026-08-18).
+    quoted = 'The seller wrote: "...we utilize a holistic fee schedule."'
+    if [f for f in check_vocabulary(quoted, mask(quoted), vocab) if f.severity == BLOCK]:
+        extra.append("quote mask: a quotation opening on an ellipsis must be exempt, the same "
+                     "as one that does not")
+    inch = 'The gap is 5" wide and this holistic approach delves into utilize land.'
+    if not [f for f in check_vocabulary(inch, mask(inch), vocab) if f.severity == BLOCK]:
+        extra.append("quote mask: an inch-mark must not open a quotation and blank the prose "
+                     "after it")
+
+    # `check_budget` keyed on CLAUDE.md alone, and install.sh names the bundle's
+    # file CLAUDE.local.md whenever the target owns its own — so §5.1a was
+    # unenforced in exactly the repos Alex does not own. The ledger check one
+    # function below documents that split and handles it (panel round 2).
+    import tempfile as _tf
+    with _tf.TemporaryDirectory() as _tmp:
+        _root = Path(_tmp)
+        (_root / ".claude").mkdir()
+        fat = "@.claude/universal.md\n\n" + " ".join("word" for _ in range(900))
+        for name in ("CLAUDE.md", "CLAUDE.local.md"):
+            hit = check_budget(_root / name, fat, _root)
+            if not [f for f in hit if f.severity == BLOCK]:
+                extra.append("budget: %s at 900 words against a cap of 200 must block" % name)
+
+    # `--text` is the output-audit loop's machine exit condition and it ran the
+    # FILE prose cap with no plain-speech check at all, so the loop could
+    # declare success on text the chat gate blocks (panel round 2).
+    loose = ("I looked at the three options. The middle one costs least. The other two need "
+             "a rewrite first.")
+    if not [f for f in chat_findings(loose, vocab) if f.severity == BLOCK]:
+        extra.append("chat findings: three sentences to Alex must block at §1.3a's cap")
+    import io as _io, tempfile as _tf2
+    from contextlib import redirect_stdout as _rso
+    with _tf2.TemporaryDirectory() as _t2:
+        _f = Path(_t2) / "draft.md"
+        _f.write_text(loose + "\n\nI merged the pull request. That is CI-042 under master §1.6.\n",
+                      encoding="utf-8")
+        with _rso(_io.StringIO()):
+            file_mode = run_text(str(_f))
+            chat_mode = run_text(str(_f), chat=True)
+    if chat_mode == 0:
+        extra.append("--chat: the audit loop's exit condition must run the same checks the "
+                     "chat gate runs, and it passed text the gate blocks")
+    if file_mode != 0:
+        extra.append("--text: file-bound prose must keep the file rules, not the chat ones")
+
     for line in extra:
         print(f"  FAIL {line}")
     if extra:
@@ -1878,11 +1985,11 @@ def main() -> int:
         return run_selftest()
     if args and args[0] == "--stop":
         return run_stop()
-    if args and args[0] == "--text":
+    if args and args[0] in ("--text", "--chat"):
         if len(args) < 2:
-            print("--text needs a file holding the prose to check", file=sys.stderr)
+            print("%s needs a file holding the prose to check" % args[0], file=sys.stderr)
             return 1
-        return run_text(args[1])
+        return run_text(args[1], chat=args[0] == "--chat")
     if not args:
         print(__doc__)
         return 0
