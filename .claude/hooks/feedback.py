@@ -138,7 +138,7 @@ def normalise(text):
     return " ".join(re.sub(r"[^\w\s]", "", text.lower()).split())
 
 
-def record_id(text, day, where=""):
+def record_id(text, day, where="", asked=""):
     """Per occurrence per day per repo, not per text.
 
     Keying on the text alone and skipping a repeat would collapse the one signal
@@ -154,7 +154,20 @@ def record_id(text, day, where=""):
     # The RAW text in the key, not just the normalised form. Normalising strips
     # punctuation, so "stop." and "stop!" hashed the same and the second
     # prompt's exact words were never stored (audit round three).
+    # `asked` carries a picker's question, and only a picker's. Two decisions
+    # answered with the same option text on the same day are two records, and
+    # without it the second collided with the first and was dropped — leaving
+    # the survivor's `about:` naming the wrong question (panel round 3,
+    # 2026-08-18).
+    #
+    # Appended ONLY when it is non-empty. Adding an empty component still
+    # changes the hash, so every id in the store moved and a re-sweep brought
+    # back the one entry Alex had ordered removed — its quote had been replaced,
+    # so it matched on neither text nor id. Caught by running the sweep against
+    # the real store before committing.
     seed = normalise(text) + "\x00" + text + "\x00" + (where or "")
+    if asked:
+        seed += "\x00" + asked
     # surrogatepass, so an id can always be computed. An unpaired surrogate
     # raised here — before the writer's own tolerant encoder saw anything — and
     # the turn was dropped entirely (audit round four).
@@ -383,6 +396,30 @@ def turn_messages(transcript_path):
     return out
 
 
+PICKER_ABOUT = "answer to Claude's question — "
+
+
+def about_of(lines):
+    for line in lines:
+        if line.startswith("about: "):
+            return line[7:].strip()
+    return ""
+
+
+def dedup_key(day, home, text, about):
+    """What makes two entries the same record.
+
+    A picker answer is identified by the question as well as the words: "Run it
+    now (Recommended)" under two different questions is two decisions, and
+    keying on the words alone dropped the second while the survivor's `about:`
+    named the wrong question. An ordinary message is identified by its words
+    alone, so the same instruction repeated in a day is one record with a count
+    of two rather than two records (panel round 3, 2026-08-18).
+    """
+    asked = normalise(about) if about.startswith(PICKER_ABOUT) else ""
+    return (day, home, normalise(text), asked)
+
+
 def where_of(lines):
     """The repo a stored record came from, off its location line.
 
@@ -442,32 +479,70 @@ def sweep(payload, root=None, today=None):
                     # docstring above claimed that closed and it was not (panel
                     # round 2, 2026-08-18).
                     day = ident[3:13]
-                    seen[(day, where_of(lines), normalise(quote))] = ident
+                    seen[dedup_key(day, where_of(lines), quote, about_of(lines))] = \
+                        (ident, day_file)
                     ids.add(ident)
         return seen, ids
 
     home = origin(root)
     already, known_ids = stored()
     added = []
+    # How many times each thing was said, so a repeat is COUNTED rather than
+    # dropped. The count is set from the transcript rather than incremented, so
+    # sweeping the same transcript twice does not inflate it — incrementing is
+    # what made a tombstoned record climb once per turn.
+    times = {}
     for text, about, said_on in turn_messages(payload.get("transcript_path")):
-        key = (said_on or fallback, home, normalise(redact(text)))
+        times[dedup_key(said_on or fallback, home, redact(text), about)] = \
+            times.get(dedup_key(said_on or fallback, home, redact(text), about), 0) + 1
+
+    for text, about, said_on in turn_messages(payload.get("transcript_path")):
+        day = said_on or fallback
+        key = dedup_key(day, home, redact(text), about)
         if key in already:
+            ident, day_file = already[key]
+            set_seen(day_file, ident, times.get(key, 1))
             continue
         # The id too, not only the words. A record whose quote was replaced —
         # the one message Alex asked to have removed — no longer matches on
         # text, so every sweep reached `capture`, found the id already there and
         # bumped its `seen` count. No content was ever written back, but the
         # count read as Alex repeating himself once per turn.
-        day = said_on or fallback
-        if record_id(text, day, origin(root)) in known_ids:
+        asked = about if about.startswith(PICKER_ABOUT) else ""
+        if record_id(text, day, home, asked) in known_ids:
             continue
         one = dict(payload)
         one["prompt"] = text
-        path, ident, hits = capture(one, root=root, today=said_on or fallback, about=about)
+        path, ident, hits = capture(one, root=root, today=day, about=about)
         if path is not None:
-            already[key] = ident
+            already[key] = (ident, path)
+            set_seen(path, ident, times.get(key, 1))
             added.append((ident, hits))
     return added
+
+
+def set_seen(day_file, ident, count):
+    """Set a record's `seen:` to a number, rather than adding one to it.
+
+    The sweep reads the whole transcript every turn, so incrementing would climb
+    once per turn for something said once. Setting it from the count in the
+    transcript is idempotent.
+    """
+    try:
+        body = Path(day_file).read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return
+    out, inside, changed = [], False, False
+    for line in lines_of(body):
+        if line.startswith("## "):
+            inside = line[3:].strip() == ident
+        if inside and line.startswith("seen: "):
+            want = "seen: %d" % count
+            changed = changed or line != want
+            line = want
+        out.append(line)
+    if changed:
+        write_atomic(Path(day_file), "\n".join(out) + "\n")
 
 
 def capture(payload, root=None, today=None, about=None):
@@ -490,7 +565,8 @@ def capture(payload, root=None, today=None, about=None):
         # twelve concurrent captures against a fresh repo left four records on
         # disk, all twelve exiting 0 in silence (audit, 2026-08-17).
         where = "%s · %s · %s" % (origin(root), branch(root), day)
-        ident = record_id(text, day, origin(root))
+        asked = about if (about or "").startswith(PICKER_ABOUT) else ""
+        ident = record_id(text, day, origin(root), asked)
         with locked(folder / (".%s.lock" % day)):
             existing = target.read_text(encoding="utf-8") if target.exists() else ""
             if ("## %s" % ident) in existing:
@@ -1278,6 +1354,44 @@ def run_selftest():
         landed = sweep({"transcript_path": str(away), "cwd": str(root)}, root=root)
         check("the same words in another repo do not shadow the home record",
               len(landed) == 1, repr(landed))
+        # Two pickers answered with the same option text on the same day are
+        # two decisions. The key held only the words, so the second was dropped
+        # and the survivor's `about:` named the wrong question — a reader six
+        # weeks later attributes the answer to whichever came first. And an
+        # ordinary message repeated the same day never reached capture at all,
+        # so its count stayed at one: the count is the one signal this store
+        # exists to measure (panel round 3, 2026-08-18).
+        twice = root / "twice.jsonl"
+        answer = 'Your questions have been answered: "%s"="Run it now (Recommended)".'
+        twice.write_text("\n".join(json.dumps(r) for r in [
+            {"type": "user", "timestamp": "2026-08-25T09:00:00.000Z",
+             "message": {"content": [{"type": "tool_result",
+                                      "content": answer % "Panel now, or after the merge?"}]}},
+            {"type": "user", "timestamp": "2026-08-25T11:00:00.000Z",
+             "message": {"content": [{"type": "tool_result",
+                                      "content": answer % "Land all twelve, or the four?"}]}},
+            {"type": "attachment", "timestamp": "2026-08-25T10:00:00.000Z",
+             "attachment": {"type": "queued_command", "prompt": "stop rewriting the summary"},
+             "origin": {"kind": "human"}},
+            {"type": "attachment", "timestamp": "2026-08-25T18:00:00.000Z",
+             "attachment": {"type": "queued_command", "prompt": "stop rewriting the summary"},
+             "origin": {"kind": "human"}},
+        ]) + "\n", encoding="utf-8")
+        sweep({"transcript_path": str(twice), "cwd": str(root)}, root=root)
+        day = (root / "memory" / "inbox" / "2026-08-25.md").read_text(encoding="utf-8")
+        check("two pickers answered the same way are two records",
+              day.count("> Run it now (Recommended)") == 2, day[:400])
+        check("and each names the question it answered",
+              "Panel now, or after the merge?" in day and "Land all twelve, or the four?" in day,
+              day[:400])
+        check("the same message twice in a day is one record with a count of two",
+              day.count("> stop rewriting the summary") == 1 and "seen: 2" in day, day[-400:])
+        sweep({"transcript_path": str(twice), "cwd": str(root)}, root=root)
+        again_day = (root / "memory" / "inbox" / "2026-08-25.md").read_text(encoding="utf-8")
+        check("and sweeping again does not inflate the count",
+              again_day.count("seen: 2") == again_day.count("seen: 2") and "seen: 3" not in again_day,
+              again_day[-300:])
+
         check("and the away record is left alone",
               "seen: 1" in (root / "memory" / "inbox" / "harvested.md").read_text(encoding="utf-8"),
               "")

@@ -210,6 +210,29 @@ def read_text(path: Path) -> str | None:
         return None
 
 
+def comma_words(body: str) -> list[str]:
+    """The comma-separated terms in one §2 block, from every line of it.
+
+    Returning on the first line meant a term added on a continuation line was
+    loaded by nothing and every check stayed green — the ban existed in the
+    rules and was enforced nowhere (audit round four). propagate.vocab_terms
+    reads the whole block too, so the two agree.
+
+    Module level, not a closure inside load_vocabulary, because the guard
+    written for that fix could not reach it: `comma_words(...) if "comma_words"
+    in dir() else None` is always None inside run_selftest, so the test was
+    unreachable in both directions (panel round 3, 2026-08-18).
+    """
+    found: list[str] = []
+    for line in body.splitlines():
+        line = line.strip()
+        if not line or line.startswith(("-", "*", "#")):
+            continue
+        head = line.split(" — ")[0]
+        found += [w.strip().lower() for w in head.split(",") if w.strip()]
+    return found
+
+
 def load_vocabulary(root: Path | None) -> dict:
     """Pull the banned lists out of the writing-standards skill.
 
@@ -253,21 +276,6 @@ def load_vocabulary(root: Path | None) -> dict:
             if all(n in name for n in needles):
                 return body
         return ""
-
-    def comma_words(body: str) -> list[str]:
-        # Every line of the block, not the first one. Returning on the first
-        # meant a term added on a continuation line was loaded by nothing and
-        # every check stayed green — the ban existed in the rules and was
-        # enforced nowhere (audit round four). propagate.vocab_terms already
-        # reads the whole block, so the two now agree.
-        found: list[str] = []
-        for line in body.splitlines():
-            line = line.strip()
-            if not line or line.startswith(("-", "*", "#")):
-                continue
-            head = line.split(" — ")[0]
-            found += [w.strip().lower() for w in head.split(",") if w.strip()]
-        return found
 
     def bullet_terms(body: str) -> dict[str, str]:
         out: dict[str, str] = {}
@@ -411,7 +419,9 @@ def mask(text: str) -> str:
     for pattern in (
         r"`[^`\n]+`",           # inline code
         r"\]\([^)\n]*\)",       # link targets
-        r"https?://\S+",
+        # Not \S+: that swallows the closing quote of a quotation ending in a
+        # URL, so the quotation never closes (panel round 3, 2026-08-18).
+        r"https?://[^\s\"'<>)\]]+",
         r"^[ \t]*>.*$",                                # blockquoted source
         r"^[ \t]*[-*][ \t]*\[\d{4}-\d{2}-\d{2}\].*$",  # ledger entries (§3.4)
     ):
@@ -440,11 +450,19 @@ def mask(text: str) -> str:
     # A quote preceded by a word character and followed by one cannot be either
     # end of a quotation — that is an inch-mark, an apostrophe-s, a code
     # artefact — so it is skipped rather than allowed to shift the pairing.
+    # Quote POSITIONS come from the masked text, so a quote inside a code span
+    # or a URL cannot pair with a real one in the prose. The neighbour
+    # characters come from the ORIGINAL, because masking turns a code span into
+    # spaces — so a quotation touching one looked like a quote against
+    # whitespace and the pairing skipped it. Either the citation was exposed to
+    # §2, or the opener stayed open and paired with the next quotation's closer,
+    # blanking a whole paragraph out of every check. Both were live on this
+    # repo's own files (panel round 3, 2026-08-18).
     partial = "".join(out)
     open_straight = None
     for m in re.finditer(r"\"", partial):
-        before = partial[m.start() - 1] if m.start() else " "
-        after = partial[m.end()] if m.end() < len(partial) else " "
+        before = text[m.start() - 1] if m.start() else " "
+        after = text[m.end()] if m.end() < len(text) else " "
         if open_straight is None:
             # An ellipsis is how a fragment is quoted mid-sentence, and `.`
             # sits in the reject set — so `"...we utilize a holistic fee
@@ -779,11 +797,17 @@ def check_structure(masked: str, prose_cap: int = 3) -> list[Finding]:
                              f"master §2: at most one em-dash aside per ~500 words of prose. "
                              f"Found {dashes} across {words} words (allowed {allowed})."))
 
-    for m in LITOTES.finditer(masked):
-        found.append(Finding(BLOCK, "litotes", line_of(masked, m.start()),
+    # One finding, at the first use, with the count in the span — the same shape
+    # the five §2 lists carry. Without it a file that already held one litotes
+    # produced a byte-identical finding before and after a write that added
+    # another, so run_hook demoted the new break to a warning naming the OLD
+    # one and the added text was never mentioned (panel round 3, 2026-08-18).
+    litotes = list(LITOTES.finditer(masked))
+    if litotes:
+        found.append(Finding(BLOCK, "litotes", line_of(masked, litotes[0].start()),
                              f"master §2 bans litotes — say the thing, not its opposite denied: "
-                             f"{m.group(0)!r}"))
-        break
+                             f"{litotes[0].group(0)!r}",
+                             span="litotes×%d" % len(litotes)))
 
     if blocks:
         last_line, last, _ = blocks[-1]
@@ -1059,6 +1083,40 @@ def payload_to_target(payload: dict) -> tuple[Path, str] | None:
     return None
 
 
+def demote_known(findings, prior):
+    """Downgrade a BLOCK the file already carried, so a write is denied only for
+    what it introduces.
+
+    `prior` is the set of (rule, message, span) triples from the pre-edit
+    content. Most spans are exact text and compare exactly; a §2 span carries an
+    occurrence count, and that count moves in BOTH directions — so comparing the
+    triple raw denied an edit that REMOVED one use of a word the file already
+    held, with a reason naming a word the write did not introduce. Only an
+    increase is new (panel round 3, 2026-08-18).
+    """
+    counted = {}
+    for rule, message, span in prior:
+        head, sep, tail = span.rpartition("\u00d7")
+        if sep and tail.isdigit():
+            key = (rule, message, head)
+            counted[key] = max(counted.get(key, 0), int(tail))
+    for finding in findings:
+        # "the skill loaded short" is a fact about this write, not a break the
+        # file's author owns. It is content-independent, so it sits in `prior`
+        # on every edit and would demote itself out of existence — cancelling
+        # the one guard that stops work when §2 is unenforced.
+        if finding.rule == "hook" or finding.severity != BLOCK:
+            continue
+        head, sep, tail = finding.span.rpartition("\u00d7")
+        if sep and tail.isdigit():
+            if int(tail) <= counted.get((finding.rule, finding.message, head), 0):
+                finding.severity = WARN
+            continue
+        if (finding.rule, finding.message, finding.span) in prior:
+            finding.severity = WARN
+    return findings
+
+
 def run_hook() -> int:
     try:
         payload = json.load(sys.stdin)
@@ -1079,15 +1137,7 @@ def run_hook() -> int:
     before = read_text(path)
     if before is not None and before != content:
         prior = {(f.rule, f.message, f.span) for f in check(path, before, root)}
-        for finding in findings:
-            # "the skill loaded short" is a fact about this write, not a break
-            # the file's author owns. It is content-independent, so it sits in
-            # `prior` on every edit and would demote itself out of existence —
-            # cancelling the one guard that stops work when §2 is unenforced.
-            if finding.rule == "hook":
-                continue
-            if finding.severity == BLOCK and (finding.rule, finding.message, finding.span) in prior:
-                finding.severity = WARN
+        findings = demote_known(findings, prior)
 
     if not findings:
         return 0
@@ -1606,6 +1656,31 @@ def run_selftest() -> int:
     # Walking the lists, not a word: the fix reached three of five and the tests
     # written for it passed, because they were written against the three it
     # touched. A check that names the lists fails the moment one is left behind.
+    # The count in the span changes in BOTH directions, so an edit that REMOVES
+    # one use of a word the file already carried produced a triple absent from
+    # `prior` and was denied — with a reason naming a word the write did not
+    # introduce. The carve-out exists for exactly that population: a target
+    # repo whose own maintainers wrote the word (panel round 3, 2026-08-18).
+    import tempfile as _tf3
+    with _tf3.TemporaryDirectory() as _t3:
+        _r3 = Path(_t3)
+        (_r3 / ".claude").mkdir()
+        note = _r3 / "note.md"
+        three = "One innovative thing.\n\nA second innovative thing.\n\nA third innovative one.\n"
+        two = "One innovative thing.\n\nA second innovative thing.\n\nA third plain one.\n"
+        four = three + "\nAnd a fourth innovative one.\n"
+        for label, after, want_block in (("removing one", two, False),
+                                         ("adding one", four, True),
+                                         ("leaving it alone", three, False)):
+            note.write_text(three, encoding="utf-8")
+            got = check(note, after, _r3)
+            was = {(f.rule, f.message, f.span) for f in check(note, three, _r3)}
+            fresh = demote_known(got, was)
+            blocked = [f for f in fresh if f.severity == BLOCK and f.rule == "banned-word"]
+            if bool(blocked) != want_block:
+                extra.append("demotion: %s use of a word the file already carried should %s"
+                             % (label, "block" if want_block else "not block"))
+
     countless = [rule for rule, sample in (("banned-word", "utilize this"),
                                            ("banned-opener", "One. Furthermore, two."),
                                            ("banned-phrase", "It serves as a buffer."))
@@ -1658,10 +1733,59 @@ def run_selftest() -> int:
 
     # A term on a continuation line must be loaded. Returning on the first line
     # of a block meant such a term was in the rules and enforced by nothing.
-    two_lines = "alpha, beta\ngamma, delta — with a note\n"
-    got = comma_words(two_lines) if "comma_words" in dir() else None
-    if got is not None and "gamma" not in got:
-        extra.append("vocabulary: a term on a continuation line is not loaded")
+    #
+    # This was guarded by `comma_words(...) if "comma_words" in dir() else None`
+    # — a closure inside load_vocabulary, never a name in this function, so the
+    # test was unreachable in both directions: the condition was always false,
+    # and had the name resolved the call would have raised (panel round 3,
+    # 2026-08-18). Driven through load_vocabulary, which is what production
+    # calls.
+    # The litotes check reported the FIRST match and stopped, with an empty
+    # span, so a file already carrying one produced a byte-identical finding
+    # before and after a write that added another — demoted to a warning
+    # naming the OLD one, with the new break never mentioned. Same defect the
+    # occurrence counts closed for the five §2 lists, on a check that has none
+    # (panel round 3, 2026-08-18).
+    one = "The first result is not bad.\n"
+    two = one + "\nThe second finding is not uncommon.\n"
+    was = {(f.rule, f.message, f.span) for f in check_structure(mask(one))}
+    now = [f for f in check_structure(mask(two)) if f.rule == "litotes"]
+    if not [f for f in now if (f.rule, f.message, f.span) not in was]:
+        extra.append("litotes: a second one added to a file that already carried one must stay "
+                     "a block, not demote behind the first")
+
+    spread = comma_words("alpha, beta\ngamma, delta — with a note\n")
+    for term in ("alpha", "beta", "gamma", "delta"):
+        if term not in spread:
+            extra.append("vocabulary: %r sits on a continuation line of its block and was not "
+                         "loaded, so the ban is enforced by nothing" % term)
+    if comma_words("- a bullet, not a comma list\n# a heading\n"):
+        extra.append("vocabulary: a bullet or a heading is not a comma-separated term list")
+
+    # A quotation touching a masked span. mask() blanks inline code, link
+    # targets and URLs to spaces, then pairs quotes by their NEIGHBOUR
+    # character in that already-masked text — so a code span at a quotation's
+    # edge made the real quote mark look like it sat against whitespace and the
+    # pairing skipped it. Two outcomes, both reachable on this repo's own files:
+    # the citation is exposed to §2, or every check goes off for a paragraph
+    # (panel round 3, 2026-08-18).
+    touching = [
+        ('a quotation ending in a code span stays exempt',
+         'The MSA states "a holistic process set by `--rate`" (MSA 4.2).', False),
+        ('a quotation opening on a code span stays exempt',
+         'The MSA states "`--rate` drives the holistic utilize schedule" (MSA 4.2).', False),
+        ('a quotation ending in a link stays exempt',
+         'He wrote "see [the holistic doc](http://x.y)" in the note.', False),
+        ('prose between two quotations is still checked',
+         'The note says "set the flag with `--all`". This holistic approach delves into '
+         'utilize land. He replied "fine".', True),
+        ('a quotation ending in a bare URL stays exempt',
+         'The page says "read https://example.com/holistic" and stops.', False),
+    ]
+    for name, sample, want in touching:
+        if bool([f for f in check_vocabulary(sample, mask(sample), vocab)
+                 if f.severity == BLOCK]) != want:
+            extra.append("quote mask: %s" % name)
 
     # The quote mask, both directions. One unpaired straight quote used to shift
     # every pair after it: `The gap is 5" wide...` hid three banned words, and
