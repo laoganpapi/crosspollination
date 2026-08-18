@@ -279,11 +279,16 @@ def load_vocabulary(root: Path | None) -> dict:
             head, _, note = body_text.partition(" — ")
             if not note:
                 continue
+            # A head may carry a grammatical annotation: "deep-dive (noun or
+            # verb)". Stored whole it becomes a key no prose contains, so the
+            # ban loads and can never fire, and the count-based floor cannot
+            # see it because a dead key still counts. Annotations are stripped
+            # before the comma split, so one containing a comma does not
+            # fragment into two dead keys (panel round 1, 2026-08-18).
+            head = re.sub(r"\s*\([^)]*\)", " ", head)
             for term in head.split(","):
-                term = term.strip().lower()
-                if term and " " not in term.strip("-"):
-                    out[term] = note.strip()
-                elif term:
+                term = " ".join(term.split()).lower()
+                if term:
                     out[term] = note.strip()
         return out
 
@@ -354,7 +359,7 @@ def fenced_spans(text: str) -> list[tuple[int, int]]:
     marker = ""
     offset = 0
     for line in text.splitlines(keepends=True):
-        run = re.match(r"(`{3,}|~{3,})", line)
+        run = re.match(r" {0,3}(`{3,}|~{3,})", line)
         if run:
             token = run.group(1)
             if open_at is None:
@@ -594,29 +599,41 @@ def check_vocabulary(text: str, masked: str, vocab: dict) -> list[Finding]:
                              f"§2 exemption claimed for: {', '.join(sorted(exempt))}. Valid only "
                              f"for a term carried from a source, never for a word Claude chose."))
 
+    # One finding per word, reported at its first use, but the span carries how
+    # many uses there are. `run_hook` demotes a BLOCK whose (rule, message,
+    # span) the file already carried; without a count in the span, adding a
+    # second use of a word the file already held produced a byte-identical
+    # finding and demoted to a warning — so §2 switched off permanently for any
+    # file that ever carried a banned word (panel round 1, 2026-08-18).
+    def uses(word: str):
+        return list(re.finditer(rf"\b{re.escape(word)}\w*\b", lowered))
+
     for word in vocab["outright"]:
         if word in exempt:
             continue
-        for m in re.finditer(rf"\b{re.escape(word)}\w*\b", lowered):
-            found.append(Finding(BLOCK, "banned-word", line_of(masked, m.start()),
-                                 f"master §2 bans {word!r} outright."))
-            break
+        hits = uses(word)
+        if hits:
+            found.append(Finding(BLOCK, "banned-word", line_of(masked, hits[0].start()),
+                                 f"master §2 bans {word!r} outright.",
+                                 span=f"{word}×{len(hits)}"))
 
     for word, note in vocab["replace"].items():
         if word in exempt:
             continue
-        for m in re.finditer(rf"\b{re.escape(word)}\w*\b", lowered):
-            found.append(Finding(BLOCK, "banned-word", line_of(masked, m.start()),
-                                 f"master §2: {word!r} — {note}"))
-            break
+        hits = uses(word)
+        if hits:
+            found.append(Finding(BLOCK, "banned-word", line_of(masked, hits[0].start()),
+                                 f"master §2: {word!r} — {note}",
+                                 span=f"{word}×{len(hits)}"))
 
     for word, note in vocab["sense"].items():
         if word in exempt:
             continue
-        for m in re.finditer(rf"\b{re.escape(word)}\w*\b", lowered):
-            found.append(Finding(WARN, "banned-sense", line_of(masked, m.start()),
-                                 f"master §2: {word!r} — {note}"))
-            break
+        hits = uses(word)
+        if hits:
+            found.append(Finding(WARN, "banned-sense", line_of(masked, hits[0].start()),
+                                 f"master §2: {word!r} — {note}",
+                                 span=f"{word}×{len(hits)}"))
 
     for word in vocab["openers"]:
         for m in re.finditer(rf"(?:^|(?<=[.!?])\s+){re.escape(word)}\b", lowered, re.MULTILINE):
@@ -1539,6 +1556,36 @@ def run_selftest() -> int:
         extra.append("demotion: a second, different four-sentence paragraph must stay a block "
                      "(got %d new finding(s))" % len(fresh))
 
+    # The same demotion, on the check it was never wired to. A vocabulary
+    # finding carried no span and reported only the FIRST occurrence, so a file
+    # already holding a banned word demoted every later one Claude added — §2
+    # switched off permanently for that file (panel round 1, 2026-08-18).
+    kept = "The vendor calls the product innovative.\n"
+    added = kept + "\nOur innovative approach ships tomorrow.\n"
+    was = check_vocabulary(kept, mask(kept), vocab)
+    now = check_vocabulary(added, mask(added), vocab)
+    seen = {(f.rule, f.message, f.span) for f in was}
+    if not [f for f in now if (f.rule, f.message, f.span) not in seen]:
+        extra.append("demotion: adding a second use of a word the file already carried must "
+                     "stay a block, not demote behind the first")
+    if [f for f in check_vocabulary(kept, mask(kept), vocab)
+            if (f.rule, f.message, f.span) not in seen]:
+        extra.append("demotion: an unchanged file must not report its own word as new")
+
+    # A term stored with its grammatical annotation is a key no prose contains,
+    # so the ban loads and can never fire. "deep-dive (noun or verb)" was banned
+    # in the skill and enforced by nothing; the count-based floor could not see
+    # it, because a dead key still counts (panel round 1, 2026-08-18).
+    annotated = [w for group in ("outright", "replace", "sense", "openers")
+                 for w in vocab[group] if "(" in w or ")" in w]
+    if annotated:
+        extra.append("vocabulary: %d term(s) loaded with an annotation still attached, which "
+                     "no prose can match: %s" % (len(annotated), ", ".join(sorted(annotated))))
+    if not [f for f in check_vocabulary("Here is a deep-dive into the numbers.",
+                                        mask("Here is a deep-dive into the numbers."), vocab)
+            if f.severity == BLOCK]:
+        extra.append("vocabulary: 'deep-dive' is banned in the skill and must block")
+
     # The 200-word cap is on the CLAUDE.md this system installs, and that file
     # lives in the target repos — the only place the check did not run.
     import tempfile
@@ -1600,6 +1647,19 @@ def run_selftest() -> int:
         # tested it: breaking it left the suite green (calibration, 2026-08-18).
         ('an unclosed fence runs to the end rather than exposing what follows',
          'text before\n\n```\nholistic delve utilize\n', False),
+        # A fence indented under a list item or a numbered step is ordinary
+        # CommonMark and was invisible to the masker: its contents faced every
+        # check, and a mismatched indent turned the surviving marker into an
+        # opener that never closed, blanking the rest of the message (panel
+        # round 1, 2026-08-18).
+        ('a fence indented under a list item stays exempt',
+         '- Run this:\n\n  ```\n  holistic delve utilize\n  ```\n\n- Done.\n', False),
+        ('prose after an indented fence is still checked',
+         '- Run this:\n\n  ```\n  code\n  ```\n\nThis holistic approach delves into utilize.',
+         True),
+        ('an indented opener closed at column zero does not blank the rest',
+         '- Example:\n\n  ```\n  code\n```\n\nThis holistic approach delves into utilize.',
+         True),
     ]
     for name, text, want in mask_cases:
         if bool([f for f in chat_findings(text, vocab) if "§2" in f.message]) != want:

@@ -247,9 +247,16 @@ def day_of(entry, box):
     return stamp[:10] if len(stamp) >= 10 and stamp[4] == "-" else None
 
 
+# The picker has more than one wording, and anchoring on one of them threw the
+# other away: eleven answers across five days, four of which exist nowhere in
+# this repo. "The user answered:" is the shape that carries text Alex typed
+# himself rather than an option Claude wrote — his free-text redirects, which
+# are the answers worth most (panel round 1, 2026-08-18). The trailing
+# boilerplate differs between the two and is simply not required.
 ANSWERED = re.compile(
-    r"^Your questions have been answered:\s*(.*?)\s*"
-    r"(?:You can now continue with these answers in mind\.)?\s*$", re.S)
+    r"^(?:Your questions have been answered|The user answered):\s*(.*?)\s*"
+    r"(?:(?:You can now continue with these answers in mind|"
+    r"Read the answers carefully)\b.*)?$", re.S)
 ANSWER_PAIR = re.compile(r'"([^"]+)"\s*=\s*"([^"]*)"')
 
 
@@ -382,12 +389,20 @@ def sweep(payload, root=None, today=None):
     folder, _home = inbox(root)
 
     def stored():
-        """What the store already holds, keyed by the words rather than the id.
+        """What the store already holds, keyed by the day and the words.
 
         The id cannot be the key here. `UserPromptSubmit` receives the prompt
         wrapped in context the transcript never stores, so the same message
         hashes differently down the two paths — matching on ids re-recorded
         every message in the store, measured at 34 duplicates on 2026-08-17.
+
+        The day belongs in the key with them. Keyed on words alone across every
+        day file, the same words said again on a later day were dropped with no
+        record and no count — and the count is the one signal this store exists
+        to measure (§3, record_id's own note). `harvested.md` is in this folder
+        too, so words typed in another repo silently blocked capture here.
+        Picker answers repeat by construction, so it fell hardest on decisions
+        (panel round 1, 2026-08-18).
         """
         seen, ids = {}, set()
         if folder.is_dir():
@@ -396,14 +411,17 @@ def sweep(payload, root=None, today=None):
                 for ident, _start, lines in blocks(body):
                     quote = "\n".join(line[2:] if line.startswith("> ") else line[1:]
                                        for line in quote_of(lines))
-                    seen[normalise(quote)] = ident
+                    # The day comes off the id, which carries it, rather than
+                    # off the filename — a harvested record keeps its own day.
+                    day = ident[3:13]
+                    seen[(day, normalise(quote))] = ident
                     ids.add(ident)
         return seen, ids
 
     already, known_ids = stored()
     added = []
     for text, about, said_on in turn_messages(payload.get("transcript_path")):
-        key = normalise(redact(text))
+        key = (said_on or fallback, normalise(redact(text)))
         if key in already:
             continue
         # The id too, not only the words. A record whose quote was replaced —
@@ -1075,9 +1093,13 @@ def run_selftest():
         # the message wrapped in context the transcript never stores, so the two
         # paths hash the same message to different ids; matching on ids
         # re-recorded all 34 messages already in the store on 2026-08-17.
-        hand = root / "memory" / "inbox" / "2026-08-12.md"
-        hand.write_text("# Feedback captured 2026-08-12\n\n"
-                        "## fb-2026-08-12-0000000000\nwhere\nsignals: none\nseen: 1\n"
+        # Same day as the sweep below: the guard is that the same words already
+        # stored for that day are not written twice under a second id. A later
+        # day is a different record, which the cross-day case further down
+        # asserts on purpose.
+        hand = root / "memory" / "inbox" / "2026-08-15.md"
+        hand.write_text("# Feedback captured 2026-08-15\n\n"
+                        "## fb-2026-08-15-0000000000\nwhere\nsignals: none\nseen: 1\n"
                         "status: new\n\n> already here under another id\n\n", encoding="utf-8")
         dupe_log = root / "dupe.jsonl"
         dupe_log.write_text(json.dumps(
@@ -1128,6 +1150,24 @@ def run_selftest():
              "message": {"content": [{"type": "tool_result", "content":
                  "grep found: Your questions have been answered: \"q\"=\"a\""}]}},
         ]) + "\n", encoding="utf-8")
+        # The picker has a second wording. "The user answered:" is the shape
+        # the harness emits, and it is the one that carries text Alex typed
+        # himself rather than an option Claude wrote — his free-text redirects.
+        # Anchored on one literal, eleven of them were discarded across five
+        # days, four of which exist nowhere in this repo (panel round 1,
+        # 2026-08-18).
+        other = root / "other.jsonl"
+        other.write_text(json.dumps(
+            {"type": "user", "timestamp": "2026-08-09T10:00:00.000Z",
+             "message": {"content": [{"type": "tool_result", "content":
+                 'The user answered: "Which way?"="no books, only memory graph". '
+                 'Read the answers carefully \u2014 they may request clarification, '
+                 'changes, or that you not proceed - and follow what they actually say.'}]}}
+        ) + "\n", encoding="utf-8")
+        second = [text for text, _a, _d in turn_messages(str(other))]
+        check("the picker's other wording is recorded",
+              "no books, only memory graph" in second, repr(second))
+
         chose = turn_messages(str(picked))
         answers = [text for text, _about, _day in chose]
         check("a picker answer is recorded", "Leave them open" in answers, repr(answers))
@@ -1153,6 +1193,28 @@ def run_selftest():
         ]) + "\n", encoding="utf-8")
         quiet = sweep({"transcript_path": str(noise), "cwd": str(root)}, root=root)
         check("a compaction summary is not recorded as Alex", quiet == [], repr(quiet))
+
+        # De-duplication is per day, the way `capture` and `record_id` are. Keyed
+        # on the words alone across every day file, the same words said again on
+        # a later day were dropped with no record and no count — which is the
+        # one signal the store exists to measure. Picker answers repeat by
+        # construction ("Leave them open", anything ending "(Recommended)"), so
+        # this fell on exactly the decisions worth counting (panel round 1,
+        # 2026-08-18).
+        again_log = root / "again.jsonl"
+        words = "the very same words on another day"
+        for day in ("2026-08-20", "2026-08-21"):
+            again_log.write_text(json.dumps(
+                {"type": "attachment", "timestamp": day + "T09:00:00.000Z",
+                 "attachment": {"type": "queued_command", "prompt": words},
+                 "origin": {"kind": "human"}}) + "\n", encoding="utf-8")
+            sweep({"transcript_path": str(again_log), "cwd": str(root)}, root=root)
+        check("the same words on a later day are their own record",
+              (root / "memory" / "inbox" / "2026-08-21.md").is_file(),
+              str(sorted(x.name for x in (root / "memory" / "inbox").glob("*.md"))))
+        first = (root / "memory" / "inbox" / "2026-08-20.md").read_text(encoding="utf-8")
+        check("and the first day's record is not touched by the second",
+              first.count(words) == 1 and "seen: 1" in first, first[-260:])
 
     for line in failures:
         print("FAIL " + line)

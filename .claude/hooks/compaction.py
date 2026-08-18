@@ -200,8 +200,15 @@ def run_selftest() -> int:
     # regression, 2026-08-13: a fixed tail window was tried first and missed the
     # real boundary in this repo's own session, which sits 9 MB from the end.
     # Heavy tool output after a compaction scrolls it out of any tail.
+    # The case has to be bigger than the bug it guards. At 400 entries it put
+    # 1.6 MB after the boundary, so any reintroduced tail window above ~1.7 MB
+    # passed it while still failing at the 9 MB the bug occurred at — and this
+    # repo's own transcript carries boundaries 13.8 MB and 7.7 MB from the end
+    # (panel round 1, 2026-08-18). 2,500 entries puts 10 MB after it.
     bulk = {"type": "user", "message": {"content": "x" * 4000}}
-    path = transcript([ordinary, boundary] + [bulk] * 400)
+    path = transcript([ordinary, boundary] + [bulk] * 2500)
+    if Path(path).stat().st_size < 10_000_000:
+        check("the far-boundary case is bigger than the bug it guards", False, True)
     uuid, _, _ = newest_boundary(path)
     check("a boundary far from the end is still found", uuid, "abc-123")
 
@@ -260,6 +267,31 @@ def run_selftest() -> int:
             checks += 1
             if "did not run" not in drive({"session_id": "s1"}):
                 failures.append("run_check stayed silent with no transcript in the payload")
+
+            # The branch where the marker cannot be written. Every drive above
+            # runs with TMPDIR pointing at a writable temp directory, so the
+            # OSError arm was never entered: the one-document guard could only
+            # ever watch the happy path, and reverting the fix it commemorates
+            # left the suite green (panel round 1, 2026-08-18).
+            os.environ["TMPDIR"] = str(pathlib.Path(tmp) / "nowhere" / "deeper")
+            try:
+                stuck = drive({"transcript_path": str(log), "session_id": "s-unwritable"})
+            finally:
+                os.environ["TMPDIR"] = tmp
+            checks += 1
+            try:
+                one = json.loads(stuck)
+            except ValueError as exc:
+                one = None
+                failures.append("with the marker unwritable, run_check printed something that "
+                                "is not one JSON document: %s" % exc)
+            checks += 1
+            if one is not None and "additionalContext" not in json.dumps(one):
+                failures.append("with the marker unwritable, the compaction notice was lost")
+            checks += 1
+            if one is not None and "may repeat" not in one.get("systemMessage", ""):
+                failures.append("with the marker unwritable, the warning that the notice may "
+                                "repeat was not sent")
         finally:
             if held is None:
                 os.environ.pop("TMPDIR", None)
