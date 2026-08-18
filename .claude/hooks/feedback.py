@@ -247,6 +247,48 @@ def day_of(entry, box):
     return stamp[:10] if len(stamp) >= 10 and stamp[4] == "-" else None
 
 
+ANSWERED = re.compile(
+    r"^Your questions have been answered:\s*(.*?)\s*"
+    r"(?:You can now continue with these answers in mind\.)?\s*$", re.S)
+ANSWER_PAIR = re.compile(r'"([^"]+)"\s*=\s*"([^"]*)"')
+
+
+def picker_answers(content):
+    """Alex's answers to a picker, which arrive as a tool result rather than as
+    a message he typed.
+
+    Every turn ending on a decision ends on a picker (§1.3b), so the picker is
+    where most of his decisions are made — and none of them reached the store.
+    Nineteen went past in this session's transcript across five days, among them
+    "Land all twelve and raise the cap" and "Remove that entry entirely". The
+    hole is the same one mid-turn messages had: the entry is in the transcript
+    and the capture path was not looking at that shape.
+
+    The quote stored is his answer; the question is recorded as what it was
+    about, so a reader can never mistake one for the other. Anchored at the
+    start of the result, because a shell command that printed the phrase is a
+    tool result too.
+    """
+    out = []
+    for block in content:
+        if not (isinstance(block, dict) and block.get("type") == "tool_result"):
+            continue
+        body = block.get("content")
+        if isinstance(body, list):
+            body = "".join(part.get("text", "") for part in body
+                           if isinstance(part, dict))
+        if not isinstance(body, str):
+            continue
+        answered = ANSWERED.match(body.strip())
+        if not answered:
+            continue
+        for question, answer in ANSWER_PAIR.findall(answered.group(1)):
+            answer = answer.strip()
+            if answer:
+                out.append((answer, "answer to Claude's question — " + question.strip()))
+    return out
+
+
 def turn_messages(transcript_path):
     """Every real thing Alex said in the transcript, oldest first, with the
     reply each one followed.
@@ -308,7 +350,13 @@ def turn_messages(transcript_path):
         if kind != "user" or entry.get("isSidechain") or entry.get("isMeta"):
             continue
         if isinstance(content, list):
-            # A tool result arrives as a user entry and is not Alex speaking.
+            # A tool result arrives as a user entry and is not Alex speaking —
+            # except when it carries a picker answer, which is him choosing.
+            picked = picker_answers(content)
+            if picked:
+                for answer, asked in picked:
+                    out.append((answer, asked, day_of(entry, None)))
+                continue
             if any(isinstance(b, dict) and b.get("type") == "tool_result" for b in content):
                 continue
             text = "\n".join(b.get("text", "") for b in content
@@ -1061,6 +1109,38 @@ def run_selftest():
               after[:200])
         check("and its count does not climb each sweep", "seen: 1" in after,
               after[:200])
+
+        # A picker answer is a decision Alex made, and it reaches the
+        # transcript as a tool result rather than as a message he typed, so the
+        # skip above threw every one away. Nineteen across five days in this
+        # session alone, including "Land all twelve and raise the cap" and
+        # "Remove that entry entirely" — the two largest decisions of the week.
+        picked = root / "picked.jsonl"
+        answered = ('Your questions have been answered: "Which way?"="Leave them open", '
+                    '"And the other one?"="Fix it now (Recommended)". '
+                    'You can now continue with these answers in mind.')
+        picked.write_text("\n".join(json.dumps(r) for r in [
+            {"type": "user", "timestamp": "2026-08-09T09:00:00.000Z",
+             "message": {"content": [{"type": "tool_result", "content": answered}]}},
+            # A shell command that printed the phrase is not Alex answering. The
+            # match is anchored at the start of the result for exactly this.
+            {"type": "user", "timestamp": "2026-08-09T09:01:00.000Z",
+             "message": {"content": [{"type": "tool_result", "content":
+                 "grep found: Your questions have been answered: \"q\"=\"a\""}]}},
+        ]) + "\n", encoding="utf-8")
+        chose = turn_messages(str(picked))
+        answers = [text for text, _about, _day in chose]
+        check("a picker answer is recorded", "Leave them open" in answers, repr(answers))
+        check("both answers in one picker are recorded",
+              "Fix it now (Recommended)" in answers, repr(answers))
+        check("a tool result only quoting the phrase is not read as an answer",
+              len(answers) == 2, repr(answers))
+        asked = {text: about for text, about, _day in chose}
+        check("the question it answered is stored beside it",
+              asked.get("Leave them open", "").endswith("Which way?"), repr(asked))
+        check("a picker answer is dated by when it was given",
+              len(chose) == 2 and all(day == "2026-08-09" for _t, _a, day in chose),
+              repr(chose))
 
         # A compaction summary and an interface marker are not Alex.
         noise = root / "noise.jsonl"
