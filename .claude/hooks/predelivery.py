@@ -1123,6 +1123,50 @@ CHAT_PROSE_CAP = 2   # §1.3a, anything addressed to Alex directly
 FILE_PROSE_CAP = 3   # §7.8, a document written for someone else
 
 
+# Words that mean nothing outside this machine. §1.6 bans them in anything
+# addressed to Alex; nothing enforced it until 2026-08-18, when he said the
+# conversation "looks alien" for the third time.
+#
+# Scoped to what he has actually objected to, and no wider. File paths are
+# deliberately absent: `mask()` blanks backticked spans, none of the 24 real
+# messages measured carried a bare path, and a raw-text path pattern collides
+# with the rule's own carve-out for a file he asked for by name.
+JARGON = [
+    (re.compile(r"§\s?\d"), "a § number"),
+    (re.compile(r"\b(?:CI|RU|RW|VD|NS|FH|WC|PK)-\d{3,}\b"), "a memory-node id"),
+    (re.compile(r"\bfb-\d{4}-\d{2}-\d{2}-[0-9a-f]{6,}\b"), "a capture-record id"),
+    (re.compile(r"(?i)\b(?:commit|committed|rebase[d]?|force-push(?:ed)?|merge[d]?\s+the\s+pr|"
+                r"pull request|PR\s*#\d+|branch(?:es)?|trunk|origin/\w+|HEAD|stash(?:ed)?|"
+                r"cherry-pick(?:ed)?|squash(?:ed)?)\b"), "git jargon"),
+    (re.compile(r"(?i)\b(?:stdout|stderr|stdin|regex|repo(?:sitory)?|selftest|"
+                r"CI\s+(?:green|red|passed|failed)|exit\s+code|traceback|"
+                r"hook(?:s)?\b(?!\s+(?:up|into\s+you)))\b"), "a machine word"),
+]
+# Said to Alex often enough, and harmless enough, that flagging them is noise.
+JARGON_OK = re.compile(r"(?i)\b(?:branches?\s+of\s+a\s+tree|merged?\s+into\s+one)\b")
+
+
+def check_jargon(masked: str) -> list[Finding]:
+    """§1.6, for chat only.
+
+    Deliverables are exempt on purpose: a document written for someone else may
+    need the domain's own words, and §1.6 governs what reaches Alex. This runs
+    from `chat_findings` and from nowhere else.
+    """
+    found: list[Finding] = []
+    seen: set[str] = set()
+    for pattern, what in JARGON:
+        for m in pattern.finditer(masked):
+            word = m.group(0)
+            if JARGON_OK.search(word) or word.lower() in seen:
+                continue
+            seen.add(word.lower())
+            found.append(Finding(BLOCK, "jargon", line_of(masked, m.start()),
+                                 f"master §1.6: {word!r} is {what} — it means nothing to Alex. "
+                                 f"Say what happened and what it means for him."))
+    return found
+
+
 def chat_findings(text: str, vocab: dict) -> list[Finding]:
     """What the chat gate checks. Named so a test can reach it.
 
@@ -1132,7 +1176,9 @@ def chat_findings(text: str, vocab: dict) -> list[Finding]:
     cannot catch that; it has to go through whatever run_stop actually uses.
     """
     masked = mask(text)
-    return check_vocabulary(text, masked, vocab) + check_structure(masked, CHAT_PROSE_CAP)
+    return (check_vocabulary(text, masked, vocab)
+            + check_structure(masked, CHAT_PROSE_CAP)
+            + check_jargon(masked))
 
 
 def run_stop() -> int:
@@ -1617,6 +1663,40 @@ def run_selftest() -> int:
         if "1.3a" not in _drive_stop({"transcript_path": str(log)}):
             extra.append("chat gate: a break before a 300 KB tool result was not seen — "
                          "the turn is being read through a tail window")
+
+        # §1.6, the plain-English rule, which nothing enforced until Alex said
+        # the conversation "looks alien" for the third time. Driven through the
+        # Stop gate, not by calling check_jargon, because the point is that it
+        # reaches chat and only chat.
+        for said, why in (("I pushed the fix to the branch and merged the pull request.", "git"),
+                          ("That is recorded as CI-042 in the graph.", "a node id"),
+                          ("Master §1.6 covers this.", "a § number"),
+                          ("The selftest passed and stdout was empty.", "machine words")):
+            log.write_text(
+                _j.dumps({"type": "user", "message": {"content": "hi"}}) + "\n" +
+                _j.dumps({"type": "assistant",
+                          "message": {"content": [{"type": "text", "text": said}]}}) + "\n",
+                encoding="utf-8")
+            if "1.6" not in _drive_stop({"transcript_path": str(log)}):
+                extra.append("chat gate: %s reached Alex unflagged (%r)" % (why, said))
+        plain = "I fixed the thing you asked about and checked it works."
+        log.write_text(
+            _j.dumps({"type": "user", "message": {"content": "hi"}}) + "\n" +
+            _j.dumps({"type": "assistant",
+                      "message": {"content": [{"type": "text", "text": plain}]}}) + "\n",
+            encoding="utf-8")
+        if "1.6" in _drive_stop({"transcript_path": str(log)}):
+            extra.append("chat gate: plain words were flagged as jargon")
+
+    # A deliverable is exempt: §1.6 governs what reaches Alex, and a document
+    # written for someone else may need the domain's own words.
+    with tempfile.TemporaryDirectory() as tmp:
+        doc = Path(tmp) / "note.md"
+        spoken = _drive_hook({"tool_name": "Write", "tool_input": {
+            "file_path": str(doc),
+            "content": "# Note\n\nRun the selftest, then merge the pull request.\n"}})
+        if "1.6" in spoken:
+            extra.append("write gate: the plain-English rule leaked onto a deliverable")
 
     for line in extra:
         print(f"  FAIL {line}")
