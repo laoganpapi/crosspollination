@@ -4,6 +4,7 @@
 Usage:
     python3 .claude/hooks/feedback.py --capture   UserPromptSubmit: record the turn
     python3 .claude/hooks/feedback.py --report    unpromoted records, one line each
+    python3 .claude/hooks/feedback.py --sweep     Stop: record what the prompt hook missed
     python3 .claude/hooks/feedback.py --selftest  run the built-in tests
 
 Why this exists. Every correction in the graph reached it because a session chose
@@ -73,7 +74,12 @@ RECORD_HEAD = re.compile(r"^## (fb-\d{4}-\d{2}-\d{2}-[0-9a-f]{10})\s*$")
 
 MACHINE = re.compile(
     r"^\s*(<wake\b|<event\b|<system-reminder>|<task-notification>|<command-name>|"
-    r"<local-command-stdout>|<untrusted_external_data|\[SYSTEM NOTIFICATION)",
+    r"<local-command-stdout>|<untrusted_external_data|\[SYSTEM NOTIFICATION|"
+    # The harness writes these into the transcript as user entries. They are not
+    # Alex: the first is a compaction summary written by another pass, the second
+    # a marker the interface inserts. Both were swept as things he said.
+    r"This session is being continued from a previous conversation|"
+    r"\[Request interrupted by user)",
     re.I)
 
 
@@ -228,7 +234,148 @@ def last_assistant(transcript_path, limit=400):
     return head(said, limit)
 
 
-def capture(payload, root=None, today=None):
+def day_of(entry, box):
+    """The day a message was said, from its own timestamp.
+
+    Dating a swept message "today" is what turned the first run of this into 29
+    spurious records: the transcript holds the whole session, de-duplication is
+    per day file, and a message already recorded on 13 August got a fresh id
+    under 17 August. Recording each one on the day it was said makes the sweep
+    idempotent against the store that already exists.
+    """
+    stamp = entry.get("timestamp") or (box or {}).get("timestamp") or ""
+    return stamp[:10] if len(stamp) >= 10 and stamp[4] == "-" else None
+
+
+def turn_messages(transcript_path):
+    """Every real thing Alex said in the transcript, oldest first, with the
+    reply each one followed.
+
+    `UserPromptSubmit` fires when Alex submits a prompt and starts a turn. A
+    message he sends WHILE a turn is running never fires it, so the capture hook
+    cannot see it and the record simply has no entry. Measured on this session
+    on 2026-08-17: three of eighteen messages were missing, including two
+    standing instructions about how work should be run. The store's whole claim
+    is that forgetting is not available, and mid-turn messages were the hole in
+    it.
+
+    The transcript does hold them, as ordinary user entries, which is why the
+    sweep below can put them back.
+    """
+    if not transcript_path:
+        return []
+    try:
+        path = Path(transcript_path)
+        if not path.is_file():
+            return []
+        raw = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return []
+
+    said, out = "", []
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            entry = json.loads(line)
+        except ValueError:
+            continue
+        kind = entry.get("type")
+        content = (entry.get("message") or {}).get("content")
+        # A message sent while a turn is running is queued, and arrives as an
+        # `attachment` entry rather than a `user` one — which is precisely why
+        # `UserPromptSubmit` never fires for it. The entry marks its own origin,
+        # so a human message is told apart from the 59 task notifications in
+        # this session's transcript without guessing from the text.
+        if kind == "attachment":
+            box = entry.get("attachment") or {}
+            if box.get("type") != "queued_command":
+                continue
+            origin_kind = (entry.get("origin") or box.get("origin") or {}).get("kind")
+            queued = (box.get("prompt") or "").strip()
+            if not queued or MACHINE.match(queued):
+                continue
+            if origin_kind in (None, "human"):
+                out.append((queued, head(said, 400), day_of(entry, box)))
+            continue
+        if kind == "assistant" and not entry.get("isSidechain"):
+            if isinstance(content, list):
+                for block in content:
+                    if isinstance(block, dict) and block.get("type") == "text":
+                        said = block.get("text", "") or said
+            continue
+        if kind != "user" or entry.get("isSidechain") or entry.get("isMeta"):
+            continue
+        if isinstance(content, list):
+            # A tool result arrives as a user entry and is not Alex speaking.
+            if any(isinstance(b, dict) and b.get("type") == "tool_result" for b in content):
+                continue
+            text = "\n".join(b.get("text", "") for b in content
+                              if isinstance(b, dict) and b.get("type") == "text")
+        else:
+            text = content if isinstance(content, str) else ""
+        text = (text or "").strip()
+        if text and not MACHINE.match(text):
+            out.append((text, head(said, 400), day_of(entry, None)))
+    return out
+
+
+def sweep(payload, root=None, today=None):
+    """Record anything said this session that the store does not already hold.
+
+    Runs at Stop, where the whole turn is on disk. Every message goes through
+    `capture`, so redaction, locking and de-duplication are the same code as the
+    ordinary path — a message already recorded bumps its `seen` count and writes
+    no second entry.
+    """
+    root = root or repo_root(payload.get("cwd") or os.getcwd())
+    fallback = today or __import__("datetime").date.today().isoformat()
+    folder, _home = inbox(root)
+
+    def stored():
+        """What the store already holds, keyed by the words rather than the id.
+
+        The id cannot be the key here. `UserPromptSubmit` receives the prompt
+        wrapped in context the transcript never stores, so the same message
+        hashes differently down the two paths — matching on ids re-recorded
+        every message in the store, measured at 34 duplicates on 2026-08-17.
+        """
+        seen, ids = {}, set()
+        if folder.is_dir():
+            for day_file in sorted(folder.glob("*.md")):
+                body = day_file.read_text(encoding="utf-8", errors="replace")
+                for ident, _start, lines in blocks(body):
+                    quote = "\n".join(line[2:] if line.startswith("> ") else line[1:]
+                                       for line in quote_of(lines))
+                    seen[normalise(quote)] = ident
+                    ids.add(ident)
+        return seen, ids
+
+    already, known_ids = stored()
+    added = []
+    for text, about, said_on in turn_messages(payload.get("transcript_path")):
+        key = normalise(redact(text))
+        if key in already:
+            continue
+        # The id too, not only the words. A record whose quote was replaced —
+        # the one message Alex asked to have removed — no longer matches on
+        # text, so every sweep reached `capture`, found the id already there and
+        # bumped its `seen` count. No content was ever written back, but the
+        # count read as Alex repeating himself once per turn.
+        day = said_on or fallback
+        if record_id(text, day, origin(root)) in known_ids:
+            continue
+        one = dict(payload)
+        one["prompt"] = text
+        path, ident, hits = capture(one, root=root, today=said_on or fallback, about=about)
+        if path is not None:
+            already[key] = ident
+            added.append((ident, hits))
+    return added
+
+
+def capture(payload, root=None, today=None, about=None):
     """Append one record. Returns (path, id, signals) or (None, reason, [])."""
     text = (payload.get("prompt") or "").strip()
     if not text:
@@ -242,7 +389,7 @@ def capture(payload, root=None, today=None):
         folder.mkdir(parents=True, exist_ok=True)
         target = folder / ("%s.md" % day)
         found = signals_in(text)
-        about = last_assistant(payload.get("transcript_path"))
+        about = last_assistant(payload.get("transcript_path")) if about is None else about
         # Everything slow happens before the lock: two git calls and a
         # transcript read used to sit between the read and the write, and
         # twelve concurrent captures against a fresh repo left four records on
@@ -492,6 +639,32 @@ def run_capture():
                 "(master §10), never a node body."
                 % (", ".join(found), ident, path.parent.name + "/" + path.name, where),
         }}))
+    return 0
+
+
+def run_sweep():
+    """Stop hook: record anything said this turn that UserPromptSubmit missed."""
+    try:
+        payload = json.load(sys.stdin)
+    except Exception:
+        return 0                      # never block a turn ending
+    try:
+        added = sweep(payload)
+    except Exception as exc:
+        print(json.dumps({"systemMessage":
+                          "mid-turn capture did not run (%s). Anything said while this turn "
+                          "was running may not be recorded." % exc}))
+        return 0
+    if not added:
+        return 0
+    corrections = [ident for ident, found in added if found]
+    note = ("%d message(s) sent while the turn was running were not recorded by the prompt "
+            "hook and have been recorded now: %s."
+            % (len(added), ", ".join(ident for ident, _f in added)))
+    if corrections:
+        note += (" %s match a correction shape — write them up as nodes before this task ends."
+                 % ", ".join(corrections))
+    print(json.dumps({"systemMessage": note}))
     return 0
 
 
@@ -794,6 +967,113 @@ def run_selftest():
             failures.append("the capture hook records nothing when driven the way the "
                             "harness drives it (JSON on stdin)")
 
+    # Mid-turn messages. `UserPromptSubmit` never fires for them, so the store
+    # simply had no entry: three of Alex's messages on 2026-08-17 were missing,
+    # two of them standing instructions. They are in the transcript as queued
+    # `attachment` entries, which is what the sweep reads.
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        (root / "memory").mkdir()
+        (root / "memory" / "map.md").write_text("# map\n", encoding="utf-8")
+        log = root / "t.jsonl"
+        rows = [
+            {"type": "user", "message": {"content": "the opening prompt"}},
+            {"type": "assistant", "message": {"content": [{"type": "text", "text": "a reply"}]}},
+            {"type": "attachment", "attachment": {"type": "queued_command",
+                                                  "prompt": "sent while you were working"},
+             "origin": {"kind": "human"}},
+            {"type": "attachment", "attachment": {"type": "queued_command",
+                                                  "prompt": "a machine notice"},
+             "origin": {"kind": "task-notification"}},
+            {"type": "user", "message": {"content": [{"type": "tool_result", "content": "x"}]}},
+        ]
+        log.write_text("\n".join(json.dumps(r) for r in rows) + "\n", encoding="utf-8")
+
+        said = [text for text, _about, _day in turn_messages(str(log))]
+        check("a mid-turn message is seen", "sent while you were working" in said, repr(said))
+        check("the opening prompt is still seen", "the opening prompt" in said, repr(said))
+        check("a machine notice is not read as Alex", "a machine notice" not in said, repr(said))
+        check("a tool result is not read as Alex", len(said) == 2, repr(said))
+
+        payload = {"transcript_path": str(log), "cwd": str(root)}
+        added = sweep(payload, root=root, today="2026-08-13")
+        check("the sweep records what the prompt hook missed", len(added) == 2, repr(added))
+        again = sweep(payload, root=root, today="2026-08-13")
+        check("a second sweep records nothing new", again == [], repr(again))
+        body = (root / "memory" / "inbox" / "2026-08-13.md").read_text(encoding="utf-8")
+        check("the mid-turn text is stored verbatim",
+              "> sent while you were working" in body, body[:200])
+        check("the reply it followed is stored", "about: a reply" in body, body[:200])
+        check("a message already stored is not written twice",
+              body.count("> sent while you were working") == 1, body[:300])
+
+        # Dated by when it was said, not when the sweep ran. Dating everything
+        # "today" made the first run write 29 records that already existed under
+        # their own dates, because de-duplication is per day file.
+        old_log = root / "old.jsonl"
+        old_log.write_text(json.dumps(
+            {"type": "attachment", "timestamp": "2026-08-11T09:00:00.000Z",
+             "attachment": {"type": "queued_command", "prompt": "said on the eleventh"},
+             "origin": {"kind": "human"}}) + "\n", encoding="utf-8")
+        sweep({"transcript_path": str(old_log), "cwd": str(root)}, root=root, today="2026-08-13")
+        check("a message is filed under the day it was said",
+              (root / "memory" / "inbox" / "2026-08-11.md").is_file(),
+              str(sorted(x.name for x in (root / "memory" / "inbox").glob("*.md"))))
+        repeat = sweep({"transcript_path": str(old_log), "cwd": str(root)},
+                       root=root, today="2026-08-13")
+        check("sweeping an older transcript again adds nothing", repeat == [], repr(repeat))
+
+        # De-duplication is on the words, not the id. The prompt hook receives
+        # the message wrapped in context the transcript never stores, so the two
+        # paths hash the same message to different ids; matching on ids
+        # re-recorded all 34 messages already in the store on 2026-08-17.
+        hand = root / "memory" / "inbox" / "2026-08-12.md"
+        hand.write_text("# Feedback captured 2026-08-12\n\n"
+                        "## fb-2026-08-12-0000000000\nwhere\nsignals: none\nseen: 1\n"
+                        "status: new\n\n> already here under another id\n\n", encoding="utf-8")
+        dupe_log = root / "dupe.jsonl"
+        dupe_log.write_text(json.dumps(
+            {"type": "attachment", "timestamp": "2026-08-15T09:00:00.000Z",
+             "attachment": {"type": "queued_command",
+                            "prompt": "Already here, under another id!"},
+             "origin": {"kind": "human"}}) + "\n", encoding="utf-8")
+        dup = sweep({"transcript_path": str(dupe_log), "cwd": str(root)}, root=root)
+        check("a record stored under a different id is not written again",
+              dup == [], repr(dup))
+
+        # A record whose quote was replaced — the one message Alex had removed —
+        # matches on neither text nor nothing, and used to reach `capture` every
+        # sweep and bump its count as though he had said it again.
+        replaced = root / "memory" / "inbox" / "2026-08-10.md"
+        gone_log = root / "gone.jsonl"
+        gone_log.write_text(json.dumps(
+            {"type": "attachment", "timestamp": "2026-08-10T09:00:00.000Z",
+             "attachment": {"type": "queued_command", "prompt": "text that was taken out"},
+             "origin": {"kind": "human"}}) + "\n", encoding="utf-8")
+        sweep({"transcript_path": str(gone_log), "cwd": str(root)}, root=root)
+        body = replaced.read_text(encoding="utf-8")
+        body = body.replace("> text that was taken out", "> [removed on instruction]")
+        replaced.write_text(body, encoding="utf-8")
+        for _ in range(3):
+            sweep({"transcript_path": str(gone_log), "cwd": str(root)}, root=root)
+        after = replaced.read_text(encoding="utf-8")
+        check("a replaced quote is not re-recorded", "text that was taken out" not in after,
+              after[:200])
+        check("and its count does not climb each sweep", "seen: 1" in after,
+              after[:200])
+
+        # A compaction summary and an interface marker are not Alex.
+        noise = root / "noise.jsonl"
+        noise.write_text("\n".join(json.dumps(r) for r in [
+            {"type": "user", "timestamp": "2026-08-15T09:00:00.000Z",
+             "message": {"content": "This session is being continued from a previous "
+                                    "conversation that ran out of context."}},
+            {"type": "user", "timestamp": "2026-08-15T09:01:00.000Z",
+             "message": {"content": "[Request interrupted by user]"}},
+        ]) + "\n", encoding="utf-8")
+        quiet = sweep({"transcript_path": str(noise), "cwd": str(root)}, root=root)
+        check("a compaction summary is not recorded as Alex", quiet == [], repr(quiet))
+
     for line in failures:
         print("FAIL " + line)
     print("selftest: %d checks, %d failures" % (ran, len(failures)))
@@ -805,6 +1085,8 @@ if __name__ == "__main__":
         sys.exit(run_selftest())
     if "--report" in sys.argv:
         sys.exit(run_report())
+    if "--sweep" in sys.argv:
+        sys.exit(run_sweep())
     if "--capture" in sys.argv:
         sys.exit(run_capture())
     print(__doc__.strip().splitlines()[0])

@@ -871,7 +871,7 @@ def is_capture_file(path: Path, root: Path | None) -> bool:
 
 
 WORD_BUDGET = {
-    ".claude/universal.md": 2700,
+    ".claude/universal.md": 3150,
     "CLAUDE.md": 200,
 }
 
@@ -899,6 +899,21 @@ def check_budget(path: Path, content: str, root: Path | None) -> list[Finding]:
     words = len(content.split())
     if words <= budget:
         return []
+    if rel != ".claude/universal.md" and not is_home_repo(root):
+        # A kitted repo's CLAUDE.md holds no rules to retire: §5.1 lets it carry
+        # only the import, the context line, the ledger line, settled decisions
+        # and the amendment note, and the rules it imports are amended in the
+        # home repo, which this session may not even be able to read. What grows
+        # there is the ledger, so name the move §3.2 asks for. "Retire a rule to
+        # land one" was advice no downstream session could act on, and it landed
+        # as a BLOCK on every further write to the file — measured at the tenth
+        # ledger entry, eleven before the old rule said to migrate.
+        return [Finding(BLOCK, "budget", 0,
+                        f"master §5.1a: {rel} is {words} words against a budget of {budget}. "
+                        f"Move the ledger into `ledger.md` at the repo root and point the "
+                        f"ledger line at it (§3.2); {rel} carries only the import, the context "
+                        f"line, the ledger line, settled decisions and the amendment note "
+                        f"(§5.1). Do not trim silently.")]
     return [Finding(BLOCK, "budget", 0,
                     f"master §5.1a: {rel} is {words} words against a budget of {budget}. "
                     f"The always-loaded rules are zero-sum — retire a rule to land one, or "

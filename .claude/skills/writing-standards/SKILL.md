@@ -143,6 +143,10 @@ when writing one:
    Vary the rhythm, let length signal what matters, cut the scaffolding. Nothing mechanical checks this, so it falls to the writer on every pass.
 10. Lists hidden in sentences (master §7.8, testable form). Four or more parallel items in a comma-series is a list wearing a disguise — break it out where the items are things a reader may need to find again, compare, or count. This is the most common way a document that reads well still fails: the prose is fine sentence by sentence, and the reader cannot scan, count, or find one item again. A short series naming categories in passing is not caught by this. The one test with no judgement in it: parallel items that each begin with a repeating `Label:` — a date, a name, a category — are already a list, and only the line breaks are missing.
 11. Enumerated sections take the labelled-bullet shape (master §7.8, testable form). Any section whose job is to enumerate — risks, options, competitors, failure modes, requirements — runs one bullet per item as **name** → mechanism → consequence: what it is, why it happens, what it does to the reader's decision. Never a bare label with no mechanism, never a mechanism with no consequence. A section written this way is the standard the rest of the document is held to; if one section earns bullets, the enumerating sections beside it have not earned prose.
+12. A document never vouches for its own quality (master §7.11). No deliverable describes itself as rigorous, thorough, comprehensive, carefully checked or written in plain words. The claim buys the reader nothing: the reader is holding the thing itself, and the pass that writes the claim is the pass that did not do it. A sentence promising every term is explained on first use gets written into a document whose terms are not. Master §12.4 is the same rule for code, where "it should work" is never a delivery.
+    Carry the record instead: what was run, what was compared against what, what was not verified, and how much of each. It goes where the document already has a place for it, as a method line, a scope note, or a caveat beside the figure. Never a new appendix or a compliance section, which is the scope master §1.2 and §7.6 both refuse.
+    The test: no sentence asserts that the document is good. What survives names an act and a count the reader can check against the page: "every total recomputed from its printed rows", "three of eleven prices unverified", "figures from the filing, not the summary page".
+
 
 <!-- Propagation stamps, checked by rules/propagate.py (master §10.1). The §2 vocabulary blocks are checked by exact set equality instead and need no stamp. A stale hash does not mean this file is wrong; it means nobody has re-checked it since the master moved. -->
 <!-- from: master §7.1 sha:22a4bbc7 -->
@@ -155,4 +159,5 @@ when writing one:
 <!-- from: master §7.8 sha:f195ed7b -->
 <!-- from: master §7.9 sha:d75978af -->
 <!-- from: master §7.10 sha:3ac3bdab -->
+<!-- from: master §7.11 sha:5b187b35 -->
 <!-- from: master §11 sha:ec80fc83 -->
