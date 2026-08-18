@@ -329,6 +329,45 @@ def load_vocabulary(root: Path | None) -> dict:
 # Masking: blank out regions where the rules do not apply, keeping offsets
 # --------------------------------------------------------------------------
 
+def fenced_spans(text: str) -> list[tuple[int, int]]:
+    """Every fenced code block, as offsets into `text`.
+
+    A fence opens at the start of a line and closes at the start of a line, and
+    a run of N markers closes only on a run of N or more of the same character.
+    Both halves are load-bearing and both were learned from a failure:
+
+    - Matching ``` anywhere paired an inline ``` in prose with the next real
+      fence and blanked everything between — real prose exempted from every
+      check, and the code that should have been exempt left exposed instead
+      (audit round two).
+    - Ignoring the run length paired a four-marker opener with the three-marker
+      opener nested inside it, so the nested block stayed exposed. Measured on
+      real traffic 2026-08-18: two of the sixty-one plain-speech hits since the
+      check shipped were this, both in a document quoted into chat because Alex
+      asked for it.
+
+    An unclosed fence runs to the end of the text rather than swallowing a
+    later pair.
+    """
+    spans: list[tuple[int, int]] = []
+    open_at: int | None = None
+    marker = ""
+    offset = 0
+    for line in text.splitlines(keepends=True):
+        run = re.match(r"(`{3,}|~{3,})", line)
+        if run:
+            token = run.group(1)
+            if open_at is None:
+                open_at, marker = offset, token
+            elif token[0] == marker[0] and len(token) >= len(marker):
+                spans.append((open_at, offset + len(line)))
+                open_at, marker = None, ""
+        offset += len(line)
+    if open_at is not None:
+        spans.append((open_at, len(text)))
+    return spans
+
+
 def mask(text: str) -> str:
     """Replace code, links and comments with spaces of equal length.
 
@@ -350,15 +389,8 @@ def mask(text: str) -> str:
         blank(front.start(), front.end())
 
     # Spans that legitimately cross lines. DOTALL belongs to these only.
-    #
-    # A fence opens at the start of a line and closes at the start of a line.
-    # Matching ``` anywhere paired an inline ``` in prose with the next real
-    # fence and blanked everything between — real prose exempted from every
-    # check, and the code that should have been exempt exposed instead. An
-    # unclosed fence now runs to the end rather than swallowing a later pair
-    # (audit round two).
-    for m in re.finditer(r"^(```|~~~).*?(?:^\1|\Z)", text, re.DOTALL | re.MULTILINE):
-        blank(m.start(), m.end())
+    for start, end in fenced_spans(text):
+        blank(start, end)
     for m in re.finditer(r"<!--.*?-->", text, re.DOTALL):
         blank(m.start(), m.end())
 
@@ -1553,6 +1585,21 @@ def run_selftest() -> int:
          '```\nholistic delve utilize\n```\n', False),
         ('prose after a real fenced block is still checked',
          '```\ncode\n```\n\nThis holistic approach delves into utilize land.', True),
+        # A three-backtick fence nested inside a four-backtick one. The regex
+        # form paired the outer OPENER with the inner OPENER and left the inner
+        # block exposed to every check. Measured on real traffic 2026-08-18:
+        # two of the sixty-one plain-speech hits since the check shipped were
+        # this, in a document quoted into chat because Alex asked for it.
+        ('a fence nested inside a longer fence stays exempt',
+         '````markdown\n# Doc\n\n```\nholistic delve utilize\n```\n\nfine here.\n````\n',
+         False),
+        ('a longer fence closes only on a run at least as long',
+         '````\ncode\n```\nstill code\n````\n\nThis holistic approach delves into utilize.',
+         True),
+        # The docstring has claimed this since audit round two and nothing
+        # tested it: breaking it left the suite green (calibration, 2026-08-18).
+        ('an unclosed fence runs to the end rather than exposing what follows',
+         'text before\n\n```\nholistic delve utilize\n', False),
     ]
     for name, text, want in mask_cases:
         if bool([f for f in chat_findings(text, vocab) if "§2" in f.message]) != want:
