@@ -112,6 +112,16 @@ Applies to any deliverable whose readers act on the decisions it records — spe
 7. Per-unit format when producing a handoff: Decision / Why / Done when (2–5 observable statements) / States & events / Edge rulings / Open / Out of scope.
 8. Ratification loop. Reader-side drafts of done-when and states-and-events come back for yes/no ratification — an interview loop, not a writing assignment.
 
+9. The reading sits beside the evidence. Every table, chart or figure block carries one line saying what it means for the decision, and that line states something the cells do not — a comparison, a threshold crossed, a consequence. A bare exhibit hands the analysis back to a reader who has neither the model nor the time. This is not the scaffolding master §7.10 bans: scaffolding restates what was just said, and this says what the numbers will not.
+10. Each option carries its success conditions and the failure mirroring each. State what has to hold for an option to work and, against each condition, the way it fails. A cost is what an option charges; a failure condition is what makes it the wrong choice, and neither implies the other.
+11. Precedent carries the part that cuts against it. A case cited in support of an option gives its outcome whole, the half that argues against it included, and says in one line what it establishes. Half a case is advocacy, and a reader who already knows the case stops believing the document there.
+12. Test the recommendation to destruction and name the breaking point. Recompute it at reduced achievement and give the level at which it stops holding as a number. Name the scenario that fails and the direction it fails in — one that breaks opposite to the risk everyone is watching is itself the finding. Say what the recommendation does not fix.
+13. Say when the question is aimed at the wrong variable. Where the thing being decided moves the outcome less than something outside the question, both quantities go in the opening summary, and the section establishing it says which findings outrank the answer asked for. Not scope expansion (master §1.2): the deliverable stays what was asked and carries the finding inside it.
+14. Anchor the unit before the figures. Where numbers live in a unit the reader does not think in, open with the conversion into one they do, sized on a quantity they already recognise. State the construction rule once, in the reference note, and every figure downstream inherits it.
+15. Size the demand a figure assumes. Any projected quantity that needs somebody else to supply something — buyers, headcount, throughput, budget — is printed beside the observed size of that capacity, with its source. A number that needs the world to be ten times its measured size is a finding, not a projection.
+16. Open items name their owner and what makes the deadline. Every entry on the Open list says who decides it, by when, and what fixes that date — the event that closes the option, not a preference. An open item with no owner is a question nobody answers.
+17. A proposal says what rests on it. Anything offered as an option rather than used as an input states whether any other figure depends on it, so a reader who rejects it can tell how much of the analysis they have just lost.
+
 ## Document forms
 
 Long-form deliverables with a settled shape have their form recorded separately, loaded only
@@ -160,6 +170,6 @@ when writing one:
 <!-- from: master §7.9 sha:d75978af -->
 <!-- from: master §7.10 sha:3ac3bdab -->
 <!-- from: master §7.11 sha:5b187b35 -->
-<!-- from: master §11 sha:ec80fc83 -->
+<!-- from: master §11 sha:29634162 -->
 
-<!-- copy sha:6efba64f words:2887 -->
+<!-- copy sha:9c4b7af8 words:3392 -->
